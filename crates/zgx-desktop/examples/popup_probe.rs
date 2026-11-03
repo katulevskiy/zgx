@@ -76,17 +76,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // is resized in place, never shown anew (on Wayland,
             // `xdg_popup.reposition`: run with `WAYLAND_DEBUG=1` to see).
             let grow = std::env::var_os("POPUP_PROBE_GROW").is_some();
+            // `POPUP_PROBE_TINT=ms`: that popover opens by itself and
+            // changes its color a step every `ms` (2: as fast as a mouse's
+            // moves come) at one size, as a popup whose content alone
+            // changes (a slider dragged in it): its frames with no frame of
+            // the window's.
+            let tint = std::env::var("POPUP_PROBE_TINT")
+                .ok()
+                .map(|ms| ms.parse::<u64>().unwrap_or(2));
             let size = cx.ui.signal((200_f32, 120_f32));
-            let popup = if grow || std::env::var_os("POPUP_PROBE_POPOVER").is_some() {
+            let shade = cx.ui.signal(0_u32);
+            let popover_shown = grow || tint.is_some();
+            let popup = if popover_shown || std::env::var_os("POPUP_PROBE_POPOVER").is_some() {
                 popover("Details", open.clone(), anchor)
                     .reactive_style({
-                        let size = size.clone();
+                        let (size, shade) = (size.clone(), shade.clone());
                         move || {
                             let (w, h) = size.get();
-                            Styles::new().w(w).h(h)
+                            let step = shade.get() % 64;
+                            Styles::new()
+                                .w(w)
+                                .h(h)
+                                .bg(rgb(0x4a3768 + (step << 16) + (step << 8)))
                         }
                     })
-                    .bg(rgb(0x4a3768))
                     .arrow(8.)
             } else {
                 menu("File", open.clone(), anchor)
@@ -172,6 +185,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         sleep(300).await;
                         println!("GROWN");
+                        open.set(false);
+                        sleep(200).await;
+                        window.close();
+                    });
+                }
+                if let Some(every) = tint {
+                    let (open, window) = (open.clone(), cx.window.clone());
+                    cx.tasks.spawn(async move {
+                        let sleep = |ms| zgx::timer::sleep(std::time::Duration::from_millis(ms));
+                        sleep(500).await;
+                        open.set(true);
+                        sleep(300).await;
+                        println!("TINT");
+                        let start = std::time::Instant::now();
+                        let mut step = 0;
+                        while start.elapsed() < std::time::Duration::from_secs(3) {
+                            step += 1;
+                            shade.set(step);
+                            sleep(every).await;
+                        }
+                        println!("STEPS {step}");
+                        sleep(300).await;
+                        println!("TINTED");
                         open.set(false);
                         sleep(200).await;
                         window.close();
