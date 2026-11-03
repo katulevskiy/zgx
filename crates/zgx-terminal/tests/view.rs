@@ -73,6 +73,7 @@ impl Harness {
         self.texts().iter().any(|shown| shown == text)
     }
     /// The family `text` is drawn in, where it shows.
+    #[cfg(unix)]
     fn family_of(&self, text: &str) -> Option<zgx::text_layout::FontFamily> {
         let scene = self.ui.scene.borrow();
         scene.paint_items().find_map(|item| match item.kind {
@@ -533,7 +534,9 @@ fn a_windows_programs_output_shows_in_rows() {
     app.until("the output", |app| app.shows("hello world"));
     let state = term.state().get();
     assert!(state.columns > 10 && state.rows > 5, "{state:?}");
-    assert!(term.needs_confirm_close(), "ping runs in front");
+    // cmd starts ping after its echo shows: closing asks first once ping
+    // is in front (cmd's newest child), not as soon as the echo is read.
+    app.until("ping in front", |_| term.needs_confirm_close());
 }
 
 #[cfg(unix)]

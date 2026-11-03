@@ -709,9 +709,110 @@ pub(crate) struct NativeMenu {
     window: Option<muda::Submenu>,
     /// The standard edit items it has, whose shortcuts zgx's view takes.
     standard: Vec<StandardItem>,
+    /// The model it shows.
+    model: Vec<AppMenu>,
+}
+/// `menus` with every item untitled, enabled and unchecked: two models of one
+/// shape differ only in their items' titles and states.
+#[cfg(target_os = "macos")]
+fn shape(menus: &[AppMenu]) -> Vec<AppMenu> {
+    fn plain(menu: &AppMenu) -> AppMenu {
+        AppMenu {
+            label: menu.label.clone(),
+            entries: menu
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    AppMenuEntry::Item {
+                        action,
+                        checked,
+                        accelerator,
+                        ..
+                    } => AppMenuEntry::Item {
+                        label: String::new(),
+                        action: action.clone(),
+                        enabled: true,
+                        checked: checked.map(|_| false),
+                        accelerator: accelerator.clone(),
+                    },
+                    AppMenuEntry::Submenu(child) => AppMenuEntry::Submenu(plain(child)),
+                    other => other.clone(),
+                })
+                .collect(),
+        }
+    }
+    menus.iter().map(plain).collect()
 }
 #[cfg(target_os = "macos")]
 impl NativeMenu {
+    /// Shows `menus` in place when they differ from what it shows only in
+    /// its items' titles and states (a page's Back turning on, Pin Tab
+    /// becoming Unpin Tab): the items change and the bar stays. Installing a new main menu instead
+    /// makes AppKit draw the whole bar again, a flash across it. Whether it
+    /// could.
+    pub(crate) fn update_states(&mut self, menus: &[AppMenu]) -> bool {
+        if shape(&self.model) != shape(menus) {
+            return false;
+        }
+        type Wanted = std::collections::HashMap<String, (String, bool, Option<bool>)>;
+        fn states(entries: &[AppMenuEntry], out: &mut Wanted) {
+            for entry in entries {
+                match entry {
+                    AppMenuEntry::Item {
+                        label,
+                        action,
+                        enabled,
+                        checked,
+                        ..
+                    } => {
+                        out.insert(action.0.clone(), (label.clone(), *enabled, *checked));
+                    }
+                    AppMenuEntry::Submenu(child) => states(&child.entries, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut wanted = std::collections::HashMap::new();
+        for menu in menus {
+            states(&menu.entries, &mut wanted);
+        }
+        fn apply(items: Vec<muda::MenuItemKind>, wanted: &Wanted) {
+            for kind in items {
+                match kind {
+                    muda::MenuItemKind::MenuItem(item) => {
+                        if let Some((label, enabled, _)) = wanted.get(&item.id().0) {
+                            if item.text() != *label {
+                                item.set_text(label);
+                            }
+                            if item.is_enabled() != *enabled {
+                                item.set_enabled(*enabled);
+                            }
+                        }
+                    }
+                    muda::MenuItemKind::Check(item) => {
+                        if let Some((label, enabled, checked)) = wanted.get(&item.id().0) {
+                            if item.text() != *label {
+                                item.set_text(label);
+                            }
+                            if item.is_enabled() != *enabled {
+                                item.set_enabled(*enabled);
+                            }
+                            if let Some(checked) = checked
+                                && item.is_checked() != *checked
+                            {
+                                item.set_checked(*checked);
+                            }
+                        }
+                    }
+                    muda::MenuItemKind::Submenu(menu) => apply(menu.items(), wanted),
+                    _ => {}
+                }
+            }
+        }
+        apply(self.menu.items(), &wanted);
+        self.model = menus.to_vec();
+        true
+    }
     pub(crate) fn new(menus: &[AppMenu]) -> Result<Self, AppMenuError> {
         validate(menus)?;
         let menu = muda::Menu::new();
@@ -802,6 +903,7 @@ impl NativeMenu {
             menu,
             window,
             standard,
+            model: menus.to_vec(),
         })
     }
     pub(crate) fn install(&self) {
@@ -930,6 +1032,75 @@ pub fn debug_key_before_menu_bar(menus: &[AppMenu], key: &str) -> Result<bool, A
     )
     .ok_or_else(|| AppMenuError("no key event".into()))?;
     Ok(offer_key(&event))
+}
+/// What `debug_menu_change` saw.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MenuChange {
+    /// Shown in place (`NativeMenu::update_states`).
+    pub in_place: bool,
+    /// The main menu AppKit shows is still the one it was: no new bar drawn.
+    pub kept: bool,
+    /// Each item of the bar's menus after, as (title, enabled, checked).
+    pub items: Vec<(String, bool, bool)>,
+}
+/// Test hook: install `first` as the application's menu bar, then show
+/// `second` as a change of the app's menus does (`Event::MenusChanged`).
+/// Main thread only.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn debug_menu_change(
+    first: &[AppMenu],
+    second: &[AppMenu],
+) -> Result<MenuChange, AppMenuError> {
+    let mut menu = NativeMenu::new(first)?;
+    menu.install();
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return Ok(MenuChange {
+            in_place: false,
+            kept: false,
+            items: Vec::new(),
+        });
+    };
+    let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+    let before = app.mainMenu();
+    let in_place = menu.update_states(second);
+    if !in_place {
+        // As the host does: the old menu leaves NSApp as it drops.
+        drop(menu);
+        menu = NativeMenu::new(second)?;
+        menu.install();
+    }
+    let after = app.mainMenu();
+    let kept = before
+        .as_ref()
+        .zip(after.as_ref())
+        .is_some_and(|(before, after)| {
+            objc2::rc::Retained::as_ptr(before) == objc2::rc::Retained::as_ptr(after)
+        });
+    let mut items = Vec::new();
+    if let Some(bar) = &after {
+        for top in (0..bar.numberOfItems()).filter_map(|i| bar.itemAtIndex(i)) {
+            let Some(submenu) = top.submenu() else {
+                continue;
+            };
+            for item in (0..submenu.numberOfItems()).filter_map(|i| submenu.itemAtIndex(i)) {
+                // NSControlStateValueOn.
+                items.push((
+                    item.title().to_string(),
+                    item.isEnabled(),
+                    item.state() == 1,
+                ));
+            }
+        }
+    }
+    drop(menu);
+    Ok(MenuChange {
+        in_place,
+        kept,
+        items,
+    })
 }
 /// Test hook: install `menus` as the application's menu bar, and the titles
 /// of the menus it shows, in order. Main thread only.
@@ -1384,6 +1555,45 @@ mod dynamic_tests {
         assert_eq!(*output.borrow(), ["find"], "the app's Find");
         assert!(!ui.find_status().open, "not zgx's");
         view.unmount();
+    }
+    /// Menus that differ only in their items' titles, or which are enabled
+    /// or checked, are shown in place (no new main menu, no flash across the
+    /// bar); any other change makes a new one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_item_states_changing_keeps_the_menu_bar() {
+        let bar = |enabled: bool, checked: bool, label: &str| {
+            vec![AppMenu::new(
+                "View",
+                [
+                    AppMenuEntry::Item {
+                        label: label.into(),
+                        action: "back".into(),
+                        enabled,
+                        checked: None,
+                        accelerator: None,
+                    },
+                    AppMenuEntry::Item {
+                        label: "Sidebar".into(),
+                        action: "sidebar".into(),
+                        enabled: true,
+                        checked: Some(checked),
+                        accelerator: None,
+                    },
+                ],
+            )]
+        };
+        assert_eq!(
+            shape(&bar(true, true, "Back")),
+            shape(&bar(false, false, "Back"))
+        );
+        assert_eq!(
+            shape(&bar(true, true, "Back")),
+            shape(&bar(true, true, "Go Back"))
+        );
+        let mut moved = bar(true, true, "Back");
+        moved[0].entries.swap(0, 1);
+        assert_ne!(shape(&bar(true, true, "Back")), shape(&moved));
     }
     #[test]
     fn zoom_items_join_a_view_menu_unless_the_app_binds_their_keys() {

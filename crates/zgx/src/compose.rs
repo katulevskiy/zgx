@@ -3557,7 +3557,12 @@ fn mount_portal_panel(
         .as_ref()
         .map(|(_, visible)| visible.clone());
     let portal = crate::compose_modal::create(ui, owner, portal_parent);
-    if !anchored {
+    // A layer (`View::layer`, a toast host) or a panel at a caret is no
+    // modal: it has no backdrop, and closes nothing as it opens.
+    let overlay_only = (view.rare.as_ref())
+        .and_then(|r| r.portal.as_ref())
+        .is_some_and(|p| p.layer || p.at_caret);
+    if !anchored && !overlay_only {
         // The theme's backdrop, following it.
         let (scene, theme, overlay) = (ui.scene.clone(), ui.theme_scope(), portal.overlay);
         ui.bind(overlay, move || {
@@ -3579,8 +3584,6 @@ fn mount_portal_panel(
     // of their own, which would otherwise stay drawn over it: as AppKit
     // closes menus and popovers when a sheet opens.
     {
-        let options = view.rare.as_ref().and_then(|r| r.portal.as_ref());
-        let overlay_only = options.is_some_and(|p| p.layer || p.at_caret);
         if !anchored && !overlay_only {
             let (was, weak, overlay) =
                 (std::cell::Cell::new(false), ui.downgrade(), portal.overlay);
@@ -3692,11 +3695,26 @@ fn mount_portal_panel(
         .map_or((None, None, None, None, None), |p| {
             (p.placement, p.modal_placement, p.autofocus, p.over, p.arrow)
         });
-    // The arrow is drawn as the panel is: a copy of its styles.
+    // The arrow is drawn as the panel is: a copy of its styles, and of what
+    // its reactive style gives each time it runs (a background following
+    // state), which the panel's style hands on (`painted`).
     let arrow = arrow.filter(|_| anchored && !is_menu).map(|size| {
         let mut styles = Styles::new();
         styles.merge(&view.styles);
-        (size, styles)
+        let painted = view.reactive_style.take().map(|mut own| {
+            let painted = ui.signal(None::<Styles>);
+            let handed = painted.clone();
+            view.reactive_style = Some(Box::new(move |out: &mut Option<Styles>| {
+                own(out);
+                let now = out.clone();
+                handed.mutate(|was| {
+                    *was = now;
+                    true
+                });
+            }));
+            painted
+        });
+        (size, styles, painted)
     });
     let placement = placement.unwrap_or_default();
     let panel_focusable = view.focusable.unwrap_or(true);
@@ -3781,7 +3799,7 @@ fn mount_portal_panel(
             // The arrow: a square drawn as the panel is, turned on its corner,
             // in a box showing the half past the panel's edge (placed with
             // the panel, `compose_popover::place_arrow`).
-            let arrow = arrow.map(|(size, styles)| {
+            let arrow = arrow.map(|(size, styles, painted)| {
                 let clip = ui.container(
                     portal.position,
                     Layout::Overlay,
@@ -3798,19 +3816,28 @@ fn mount_portal_panel(
                 // there, `Ui::set_popup_screens`): a popup window holds it.
                 ui.scene.borrow_mut().set_platform_painted(clip, true);
                 let side = size * std::f32::consts::SQRT_2;
+                // Its own shape over whatever the panel's styles say.
+                let shaped = move |styles: Styles| {
+                    styles
+                        .absolute()
+                        .w(side)
+                        .h(side)
+                        .min_w(side)
+                        .min_h(side)
+                        .max_w(side)
+                        .max_h(side)
+                        .p(0.)
+                        .rounded(0.)
+                        .rotate(std::f32::consts::FRAC_PI_4)
+                };
                 let mut square = div();
-                square.styles = styles;
-                let square = square
-                    .absolute()
-                    .w(side)
-                    .h(side)
-                    .min_w(side)
-                    .min_h(side)
-                    .max_w(side)
-                    .max_h(side)
-                    .p(0.)
-                    .rounded(0.)
-                    .rotate(std::f32::consts::FRAC_PI_4);
+                square.styles = shaped(styles);
+                if let Some(painted) = painted {
+                    square = square.reactive_style(move || match painted.get() {
+                        Some(panel) => shaped(panel),
+                        None => shaped(Styles::new()),
+                    });
+                }
                 let diamond = mount(ui, clip, square, environment.clone());
                 crate::compose_popover::Arrow {
                     clip,
