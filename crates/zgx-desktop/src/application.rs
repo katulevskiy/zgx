@@ -8872,6 +8872,7 @@ mod tests {
             drag_over: Cell::new(None),
             carrying: None,
             last_focused: None,
+            pending_move: None,
             factory,
             active: false,
             error: None,
