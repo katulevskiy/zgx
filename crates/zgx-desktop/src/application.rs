@@ -8873,6 +8873,7 @@ mod tests {
             active: false,
             error: None,
             timers: zgx::timer::host(|| {}),
+            pending_move: None,
         };
         let mut probe = Probe {
             manager,
