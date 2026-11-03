@@ -143,6 +143,11 @@ pub struct WindowInfo {
     /// buttons at the top right, macOS's traffic lights at the top left),
     /// or `None` where there are none.
     pub controls: Signal<Option<zgx::scene::Rect>>,
+    /// The window buttons the desktop asks for, by side (Linux), for an app
+    /// drawing its own over a `Titlebar::Hidden` window; `None` where the
+    /// platform draws its own (`WindowButtons`). It follows the desktop's
+    /// setting as it changes.
+    pub buttons: Signal<Option<crate::WindowButtons>>,
 }
 impl WindowInfo {
     pub(crate) fn new(ui: &Ui, width: f64, height: f64) -> Self {
@@ -160,6 +165,7 @@ impl WindowInfo {
             corner_radius: ui.signal(0.),
             titlebar_area: ui.signal(None),
             controls: ui.signal(None),
+            buttons: ui.signal(crate::window_chrome::desktop_buttons()),
         }
     }
     pub(crate) fn refresh(&self, window: &Window, titlebar: crate::Titlebar) {
@@ -212,6 +218,10 @@ impl WindowInfo {
         }
         if self.controls.with_untracked(|old| *old != controls) {
             self.controls.set(controls);
+        }
+        let buttons = crate::window_chrome::desktop_buttons();
+        if self.buttons.with_untracked(|old| *old != buttons) {
+            self.buttons.set(buttons);
         }
         self.capabilities.set(WindowCapabilities {
             global_position: !wayland,

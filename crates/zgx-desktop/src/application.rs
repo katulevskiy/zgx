@@ -6753,10 +6753,13 @@ impl WindowManager {
                 for host in self.hosts.values_mut() {
                     crate::system_colors::sync(&host.context.ui);
                     crate::scrollers::sync(&host.context.ui);
-                    // The desktop's window buttons may have moved.
+                    // The desktop's window buttons may have moved: zgx's
+                    // own, and those an app draws (`WindowInfo::buttons`).
                     #[cfg(target_os = "linux")]
-                    if let Some(caption) = &mut host.caption {
-                        caption.sync(&mut host.context.ui);
+                    {
+                        if let Some(caption) = &mut host.caption {
+                            caption.sync(&mut host.context.ui);
+                        }
                         if let Some(window) = &host.window {
                             host.context
                                 .window_info

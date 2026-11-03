@@ -1305,6 +1305,57 @@ mod win {
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{ButtonLayout, CaptionHost, resize_cursor};
 
+/// A window button an app may draw itself (`WindowButtons`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WindowButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+/// The window buttons the desktop asks a window's title bar for, in
+/// order, by side (`WindowInfo::buttons`): what an app drawing its own
+/// buttons over a `Titlebar::Hidden` window shows, where the platform's
+/// own would stand. On Linux, GNOME's `button-layout` through the settings
+/// portal (`"appmenu:close"`: close alone, at the right), as GTK 4 reads
+/// it, following it as it changes; minimize, maximize and close at the
+/// right until the portal answers or where it has none. Elsewhere `None`:
+/// macOS and Windows draw their own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowButtons {
+    pub left: Vec<WindowButton>,
+    pub right: Vec<WindowButton>,
+}
+
+/// The desktop's window buttons now (`WindowButtons`).
+pub(crate) fn desktop_buttons() -> Option<WindowButtons> {
+    #[cfg(target_os = "linux")]
+    {
+        let layout = crate::linux_appearance::current()
+            .buttons
+            .unwrap_or_default();
+        let side = |buttons: [Option<linux::WindowButton>; 3]| {
+            buttons
+                .into_iter()
+                .flatten()
+                .map(|button| match button {
+                    linux::WindowButton::Minimize => WindowButton::Minimize,
+                    linux::WindowButton::Maximize => WindowButton::Maximize,
+                    linux::WindowButton::Close => WindowButton::Close,
+                })
+                .collect()
+        };
+        Some(WindowButtons {
+            left: side(layout.left),
+            right: side(layout.right),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     //! Linux title bars, drawn by the app as GTK's header bars are (client
