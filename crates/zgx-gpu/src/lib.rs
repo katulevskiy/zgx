@@ -3939,6 +3939,13 @@ pub struct GpuRenderer {
     /// owes (`set_plane_waker`), from the plane's drawables thread.
     #[cfg(target_os = "macos")]
     plane_wake: Option<PlaneWaker>,
+    /// The window's zoom (`set_zoom`): `scale` holds it, the host layer's
+    /// points don't.
+    #[cfg(target_os = "macos")]
+    zoom: f64,
+    /// What a popup's backdrop filters blur in place of its own target, the
+    /// size of it (`set_backdrop`).
+    backdrop: Option<(wgpu::Texture, wgpu::TextureView)>,
     #[cfg(target_os = "macos")]
     native_surfaces: Option<native_surface::SurfaceCache>,
     /// The next present joins the Core Animation transaction that resized the layer.
@@ -4573,6 +4580,9 @@ impl GpuRenderer {
             views: None,
             #[cfg(target_os = "macos")]
             plane_wake: None,
+            backdrop: None,
+            #[cfg(target_os = "macos")]
+            zoom: 1.,
             #[cfg(target_os = "macos")]
             native_surfaces: None,
             #[cfg(target_os = "macos")]
@@ -4801,6 +4811,14 @@ impl GpuRenderer {
                 layer.set_caret(caret);
             }
         }
+    }
+    /// The window's zoom (`Ui::zoom`), which `set_scale_factor`'s scale
+    /// holds. Layers placed over the frames (a baked loop's, a GPU view's)
+    /// go in the host layer's points, `scale / zoom` pixels each, where the
+    /// frames' own points are `scale` pixels.
+    #[cfg(target_os = "macos")]
+    pub fn set_zoom(&mut self, zoom: f64) {
+        self.zoom = zoom;
     }
     /// Whether a caret set with `set_caret` can show: frames show through
     /// a layer the renderer presents to.
@@ -11000,11 +11018,12 @@ impl GpuRenderer {
         // so a partly damaged filter matches a fresh frame. Copies land in
         // the first atlas with the averages and stay there.
         let copies = slots.iter().any(|slot| !slot.2);
+        let source = self.backdrop.as_ref().map_or(&self.view, |(_, view)| view);
         let passes = [
             (
                 "blur reduce",
                 &pipelines.reduce,
-                bind(&self.view, &views[1]),
+                bind(source, &views[1]),
                 &views[0],
                 false,
                 false,
@@ -13126,6 +13145,7 @@ impl GpuRenderer {
     /// its last frame; the next frame recreates whatever it uses. Call when a
     /// window has stopped presenting for a while.
     pub fn trim(&mut self) {
+        self.backdrop = None;
         present_log::log(|| {
             #[cfg(target_os = "macos")]
             let plane = self.layer_present.as_ref().map_or("none", |p| p.plane());

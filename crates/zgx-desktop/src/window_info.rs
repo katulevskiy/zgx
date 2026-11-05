@@ -111,6 +111,47 @@ pub struct WindowCapabilities {
     /// The window can enter native fullscreen.
     pub native_fullscreen: bool,
 }
+/// A window going into or out of full screen, as AppKit animates it
+/// (macOS): `WindowContext::full_screen_transition`, `ui.window.full_screen_transition`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FullScreenTransition {
+    /// Going into full screen, over about this long (AppKit doesn't say:
+    /// as long as the last one this way took).
+    Entering(std::time::Duration),
+    /// Coming out of it, over about this long.
+    Leaving(std::time::Duration),
+}
+/// What AppKit says of a window's full screen (its `NSWindowWill…` and
+/// `NSWindowDid…FullScreen` notifications), or that a transition begun
+/// has had time to end (`Settled`: one that failed tells only winit's
+/// delegate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) enum FullScreenPhase {
+    WillEnter,
+    DidEnter,
+    WillExit,
+    DidExit,
+    Settled,
+}
+impl FullScreenPhase {
+    /// The transition `self` leaves: a will begins one lasting `duration`;
+    /// a did, or `Settled`, ends it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn transition(self, duration: std::time::Duration) -> Option<FullScreenTransition> {
+        match self {
+            Self::WillEnter => Some(FullScreenTransition::Entering(duration)),
+            Self::WillExit => Some(FullScreenTransition::Leaving(duration)),
+            Self::DidEnter | Self::DidExit | Self::Settled => None,
+        }
+    }
+    /// Whether the window's state is settled after `self` (its full screen
+    /// and its title bar's buttons read again).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn settles(self) -> bool {
+        !matches!(self, Self::WillEnter | Self::WillExit)
+    }
+}
 /// A window's geometry and state, kept current as signals: reading one in
 /// a view updates it when the window moves, resizes or changes display.
 #[derive(Clone)]
@@ -143,11 +184,6 @@ pub struct WindowInfo {
     /// buttons at the top right, macOS's traffic lights at the top left),
     /// or `None` where there are none.
     pub controls: Signal<Option<zgx::scene::Rect>>,
-    /// The window buttons the desktop asks for, by side (Linux), for an app
-    /// drawing its own over a `Titlebar::Hidden` window; `None` where the
-    /// platform draws its own (`WindowButtons`). It follows the desktop's
-    /// setting as it changes.
-    pub buttons: Signal<Option<crate::WindowButtons>>,
 }
 impl WindowInfo {
     pub(crate) fn new(ui: &Ui, width: f64, height: f64) -> Self {
@@ -165,10 +201,21 @@ impl WindowInfo {
             corner_radius: ui.signal(0.),
             titlebar_area: ui.signal(None),
             controls: ui.signal(None),
-            buttons: ui.signal(crate::window_chrome::desktop_buttons()),
         }
     }
     pub(crate) fn refresh(&self, window: &Window, titlebar: crate::Titlebar) {
+        self.refresh_holding(window, titlebar, None);
+    }
+    /// `refresh`, but with the title bar's area and buttons `hold` where it
+    /// is given rather than read from the window: through a full-screen
+    /// transition, where they end up (none going in; where they were
+    /// before going out), not where AppKit has them partway.
+    pub(crate) fn refresh_holding(
+        &self,
+        window: &Window,
+        titlebar: crate::Titlebar,
+        hold: Option<Chrome>,
+    ) {
         let wayland = window
             .display_handle()
             .is_ok_and(|h| matches!(h.as_raw(), RawDisplayHandle::Wayland(_)));
@@ -203,7 +250,7 @@ impl WindowInfo {
         self.fullscreen.set(window.fullscreen().is_some());
         let (area, controls) = crate::window_chrome::titlebar_area(window, titlebar);
         // In the content's points, its zoom's (a custom title bar's content
-        // zooms; the platform's own buttons do not).
+        // zooms; the buttons' own places, which `titlebar_area` gives, do not).
         let zoom = crate::popup_window::zoom_of(window.id()) as f32;
         let unzoom = |r: zgx::scene::Rect| {
             zgx::scene::Rect::new(r.x / zoom, r.y / zoom, r.width / zoom, r.height / zoom)
@@ -213,16 +260,7 @@ impl WindowInfo {
         } else {
             (area.map(unzoom), controls.map(unzoom))
         };
-        if self.titlebar_area.with_untracked(|old| *old != area) {
-            self.titlebar_area.set(area);
-        }
-        if self.controls.with_untracked(|old| *old != controls) {
-            self.controls.set(controls);
-        }
-        let buttons = crate::window_chrome::desktop_buttons();
-        if self.buttons.with_untracked(|old| *old != buttons) {
-            self.buttons.set(buttons);
-        }
+        self.set_chrome(hold.unwrap_or((area, controls)));
         self.capabilities.set(WindowCapabilities {
             global_position: !wayland,
             placement: !wayland,
@@ -232,6 +270,44 @@ impl WindowInfo {
         self.ready.set(true);
     }
 }
+/// A title bar's free area and its window's buttons, in points
+/// (`WindowInfo::titlebar_area`, `controls`).
+pub(crate) type Chrome = (Option<zgx::scene::Rect>, Option<zgx::scene::Rect>);
+/// The title bar's area and buttons to show through `transition`, if not as
+/// AppKit has them partway: where they end up, so a slide timed to it reads
+/// its target as it begins. None going in; going out, `out`, where they were
+/// before going in, if that is known.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn held_chrome(
+    transition: Option<FullScreenTransition>,
+    out: Option<Chrome>,
+) -> Option<Chrome> {
+    match transition {
+        Some(FullScreenTransition::Entering(_)) => Some((None, None)),
+        Some(FullScreenTransition::Leaving(_)) => out,
+        None => None,
+    }
+}
+impl WindowInfo {
+    /// The title bar's area and buttons as they are now.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn chrome(&self) -> Chrome {
+        (
+            self.titlebar_area.with_untracked(|area| *area),
+            self.controls.with_untracked(|controls| *controls),
+        )
+    }
+    /// Set the title bar's area and buttons, each only if it changed.
+    pub(crate) fn set_chrome(&self, (area, controls): Chrome) {
+        if self.titlebar_area.with_untracked(|old| *old != area) {
+            self.titlebar_area.set(area);
+        }
+        if self.controls.with_untracked(|old| *old != controls) {
+            self.controls.set(controls);
+        }
+    }
+}
+
 pub(crate) fn refresh_rate_hz(monitor: &MonitorHandle) -> Option<f64> {
     monitor
         .refresh_rate_millihertz()
@@ -365,4 +441,60 @@ pub(crate) fn attributes(
             .with_position(monitor.position());
     }
     Ok(attrs)
+}
+
+#[cfg(test)]
+mod full_screen_tests {
+    use super::{FullScreenPhase, FullScreenTransition};
+    use std::time::Duration;
+
+    /// Through a transition the title bar's rects say where they end up.
+    #[test]
+    fn a_transition_holds_the_title_bar_where_it_ends_up() {
+        use super::{Chrome, held_chrome};
+        let half = Duration::from_millis(500);
+        let rect = zgx::scene::Rect::new(12., 13., 52., 16.);
+        let out: Chrome = (None, Some(rect));
+        assert_eq!(
+            held_chrome(Some(FullScreenTransition::Entering(half)), Some(out)),
+            Some((None, None))
+        );
+        assert_eq!(
+            held_chrome(Some(FullScreenTransition::Leaving(half)), Some(out)),
+            Some(out)
+        );
+        // Out with nowhere known to go back to (it opened in full screen),
+        // and with no transition: as the window has them.
+        assert_eq!(
+            held_chrome(Some(FullScreenTransition::Leaving(half)), None),
+            None
+        );
+        assert_eq!(held_chrome(None, Some(out)), None);
+    }
+
+    /// AppKit's will begins a transition as long as its animation; its did
+    /// ends it, and the window is read again; a transition that failed
+    /// (no did) ends once it has had time to (`Settled`).
+    #[test]
+    fn a_full_screen_transition_runs_from_its_will_to_its_did() {
+        let half = Duration::from_millis(500);
+        assert_eq!(
+            FullScreenPhase::WillEnter.transition(half),
+            Some(FullScreenTransition::Entering(half))
+        );
+        assert_eq!(
+            FullScreenPhase::WillExit.transition(half),
+            Some(FullScreenTransition::Leaving(half))
+        );
+        for phase in [
+            FullScreenPhase::DidEnter,
+            FullScreenPhase::DidExit,
+            FullScreenPhase::Settled,
+        ] {
+            assert_eq!(phase.transition(half), None);
+            assert!(phase.settles());
+        }
+        assert!(!FullScreenPhase::WillEnter.settles());
+        assert!(!FullScreenPhase::WillExit.settles());
+    }
 }

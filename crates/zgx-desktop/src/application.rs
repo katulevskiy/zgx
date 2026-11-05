@@ -108,6 +108,17 @@ pub struct WindowOptions {
     /// drawn as it shows. X11 keeps no picture of an unmapped window: there
     /// its background shows from its mapping to its first frame.
     pub visible: bool,
+    /// How tall `Titlebar::Inset`'s caption buttons are on Windows, and its
+    /// caption strip (`WindowInfo::titlebar_area`), in the content's points,
+    /// so they span a title bar of this height at any zoom: drawn, hit-tested
+    /// and reported alike. `None` (the default) is Windows' 32 points of the
+    /// display, whatever the zoom. Other platforms place their own.
+    pub caption_height: Option<f64>,
+}
+/// A window's smallest and largest sizes are the same.
+#[cfg(any(windows, test))]
+fn fixed_size(options: &WindowOptions) -> bool {
+    options.min_size.is_some() && options.min_size == options.max_size
 }
 impl WindowOptions {
     /// Whether the window is transparent where zgx paints nothing.
@@ -140,6 +151,7 @@ impl Default for WindowOptions {
             shadow: true,
             covers_display: false,
             visible: true,
+            caption_height: None,
         }
     }
 }
@@ -164,6 +176,10 @@ enum Event {
     AppearanceChanged,
     #[cfg(target_os = "macos")]
     NativeMenuAction(crate::MenuAction),
+    /// AppKit said a window goes into or out of full screen, or is there
+    /// (`window_chrome::watch_full_screen`).
+    #[cfg(target_os = "macos")]
+    FullScreen,
     Wake(u64),
     /// The window's zoom changed (`Ui::set_zoom`): its content scale follows.
     Zoom(u64),
@@ -527,6 +543,9 @@ pub struct WindowFactory {
     /// GPU contexts made later too.
     text_language: Rc<RefCell<Option<String>>>,
     menus: Rc<RefCell<Vec<crate::AppMenu>>>,
+    /// What the last `set_menus` left out, and why: said again only as it
+    /// changes, as an app sets its menus at every state change.
+    menus_left_out: Rc<RefCell<Vec<String>>>,
     /// The keystrokes the app keeps whatever has the keyboard
     /// (`set_reserved_shortcuts`).
     reserved: Rc<RefCell<Vec<zgx::actions::Keystroke>>>,
@@ -587,11 +606,29 @@ impl WindowFactory {
             .send_event(Event::FontsReplaced)
             .map_err(|_| "application event loop is closed")
     }
-    /// Replace the application menu model for existing and future windows.
+    /// Replace the application's menus, **for every window at once**: the
+    /// macOS menu bar, each window's bar elsewhere, and the shortcuts they
+    /// bind in every window, existing and future. One window's call (a
+    /// sheet's, a plugin's panel) replaces the main window's menus too, so
+    /// pass the whole app's each time, never one window's part.
+    ///
+    /// What can't be shown is left out and the rest shown, so one bad item
+    /// never costs the bar: a menu or item with no label, an item whose
+    /// action is another's, and an accelerator no key names (⌘é) or that
+    /// another item has, dropped from its item alone. Each is written on
+    /// stderr (`zgx: menus: …`) as it first appears. An error only when the
+    /// application is closed.
     pub fn set_menus(&self, menus: Vec<crate::AppMenu>) -> Result<(), crate::AppMenuError> {
-        crate::app_menu::validate(&menus)?;
         if !self.alive.get() {
             return Err(crate::AppMenuError("application is closed".into()));
+        }
+        let (menus, left_out) = crate::app_menu::sanitize(menus);
+        {
+            let mut said = self.menus_left_out.borrow_mut();
+            for problem in left_out.iter().filter(|problem| !said.contains(problem)) {
+                eprintln!("zgx: menus: {problem}");
+            }
+            *said = left_out;
         }
         *self.menus.borrow_mut() = menus;
         self.proxy
@@ -683,6 +720,11 @@ pub struct WindowContext {
     pub dialogs: crate::FileDialogs,
     /// The window's bounds, displays and capabilities, kept current.
     pub window_info: crate::WindowInfo,
+    /// While the window goes into or out of full screen (macOS's
+    /// animation), which way and about how long it takes; `None` otherwise,
+    /// and always on Linux and Windows. `window_info.fullscreen` says
+    /// whether it is in full screen, on every platform.
+    pub full_screen_transition: Signal<Option<crate::FullScreenTransition>>,
     menu_model: Signal<Vec<crate::AppMenu>>,
     /// The window's UI: its scene, input and reactive runtime.
     pub ui: Ui,
@@ -893,9 +935,13 @@ impl Application {
         self.options = options;
         self
     }
-    /// The application menu (validated now), for every window.
+    /// The application menu, for every window: what can't be shown is left
+    /// out and said on stderr, as `WindowFactory::set_menus` does.
     pub fn menus(mut self, menus: Vec<crate::AppMenu>) -> Result<Self, crate::AppMenuError> {
-        crate::app_menu::validate(&menus)?;
+        let (menus, left_out) = crate::app_menu::sanitize(menus);
+        for problem in &left_out {
+            eprintln!("zgx: menus: {problem}");
+        }
         self.menus = menus;
         Ok(self)
     }
@@ -1036,6 +1082,7 @@ impl Application {
             #[cfg(target_os = "linux")]
             activation: Rc::default(),
             menus: Rc::new(RefCell::new(self.menus)),
+            menus_left_out: Rc::default(),
             reserved: Rc::new(RefCell::new(self.reserved)),
             pending: Rc::new(RefCell::new(VecDeque::new())),
             next: Rc::new(Cell::new(1)),
@@ -1705,6 +1752,14 @@ struct Host {
     /// It was in fullscreen as its geometry last changed: popups close as
     /// it goes in or out.
     popups_fullscreen: bool,
+    /// The full-screen transition it last began (`window_chrome::FullScreenNote`):
+    /// a `Settled` of an earlier one leaves a newer one be.
+    #[cfg(target_os = "macos")]
+    full_screen_seq: u64,
+    /// The title bar's area and buttons as they were when the window last
+    /// began going into full screen: where they are once it is out again.
+    #[cfg(target_os = "macos")]
+    chrome_out: Option<crate::window_info::Chrome>,
     /// Its content's top-left in global coordinates, and its number with
     /// the window server (macOS), for drags between windows: kept as the
     /// window moves, so a drag asks AppKit nothing as it moves.
@@ -1873,11 +1928,13 @@ impl Host {
             let handle = handle.clone();
             inspector.set_wake(move || handle.request_redraw());
         }
+        let full_screen_transition = ui.signal(None);
         let context = WindowContext {
             inspector,
             natives: native.natives.clone(),
             native_diagnostics: native.diagnostics.clone(),
             window_info,
+            full_screen_transition,
             menu_model,
             dialogs: crate::FileDialogs::new(handle.clone()),
             menu_action: None,
@@ -2050,6 +2107,10 @@ impl Host {
             popups,
             native_drag: Default::default(),
             popups_fullscreen: false,
+            #[cfg(target_os = "macos")]
+            full_screen_seq: 0,
+            #[cfg(target_os = "macos")]
+            chrome_out: None,
             content_origin: None,
             window_number: None,
             window_grab: None,
@@ -2204,6 +2265,99 @@ impl Host {
                     self.scale_factor,
                 )
             });
+        }
+    }
+    /// What AppKit said of this window's full screen (`phase`, of the
+    /// transition numbered `seq`, its animation about `duration` long):
+    /// `full_screen_transition` begins or ends with it, and once it ends
+    /// the window's full screen and title bar buttons are read again
+    /// (`WindowInfo::fullscreen`, `controls`: none in full screen).
+    #[cfg(target_os = "macos")]
+    fn full_screen(
+        &mut self,
+        phase: crate::window_info::FullScreenPhase,
+        duration: std::time::Duration,
+        seq: u64,
+    ) {
+        use crate::window_info::FullScreenPhase;
+        if matches!(
+            phase,
+            FullScreenPhase::WillEnter | FullScreenPhase::WillExit
+        ) {
+            self.full_screen_seq = seq;
+        } else if phase == FullScreenPhase::Settled && seq != self.full_screen_seq {
+            return;
+        }
+        // The title bar's area and buttons, where they end up, before the
+        // transition says it begins (a slide timed to it reads its target):
+        // none going in; going out, where they were before going in (the
+        // window takes its frame back). Once it is there, as the window has
+        // them, before the transition says it is over.
+        let info = &self.context.window_info;
+        match phase {
+            FullScreenPhase::WillEnter => {
+                self.chrome_out = Some(info.chrome());
+                info.set_chrome((None, None));
+            }
+            FullScreenPhase::WillExit => {
+                if let Some(out) = self.chrome_out {
+                    info.set_chrome(out);
+                }
+            }
+            _ => {}
+        }
+        let mut covered = false;
+        if phase.settles()
+            && let Some(window) = &self.window
+        {
+            info.refresh(window, self.options.titlebar);
+            // Covered after all, once the transition is over: an occlusion
+            // it went on drawing through is counted now.
+            covered = !*RENDER_WHEN_COVERED
+                && !self.native_occluded
+                && crate::window_chrome::occluded(window) == Some(true);
+        }
+        let transition = phase.transition(duration);
+        let signal = &self.context.full_screen_transition;
+        if signal.with_untracked(|now| *now != transition) {
+            signal.set(transition);
+        }
+        if covered {
+            self.occlude();
+        }
+    }
+    /// Minimized, or on a Space no longer shown: its menus and popovers
+    /// close, as AppKit's do (they would show again with it, still open),
+    /// and it stops presenting until it shows again.
+    fn occlude(&mut self) {
+        self.context.ui.dismiss_popups();
+        self.context.ui.cancel_interactions();
+        self.native_occluded = true;
+        self.context.ui.set_presented(false);
+        self.presentation.occlude();
+    }
+    /// Whether the window is going into or out of full screen (macOS).
+    fn in_full_screen_transition(&self) -> bool {
+        self.context
+            .full_screen_transition
+            .with_untracked(Option::is_some)
+    }
+    /// The title bar's area and buttons to show while the window's geometry
+    /// changes, if not as AppKit has them: through a full-screen transition,
+    /// where they end up (`full_screen`).
+    fn chrome_held(&self) -> Option<crate::window_info::Chrome> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::window_info::held_chrome(
+                self.context
+                    .full_screen_transition
+                    .with_untracked(|now| *now),
+                self.chrome_out,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
         }
     }
     fn sync_ime_cancellation(&mut self) {
@@ -2770,6 +2924,10 @@ impl Host {
                                 None
                             }
                         },
+                        #[cfg(windows)]
+                        renderer,
+                        #[cfg(windows)]
+                        &report.damage,
                     )
                 },
             );
@@ -3337,6 +3495,8 @@ impl Host {
         match self.make_renderer(&window) {
             Ok(mut renderer) => {
                 renderer.set_scale_factor(self.scale_factor as f32);
+                #[cfg(target_os = "macos")]
+                renderer.set_zoom(self.context.ui.zoom());
                 if self.options.is_transparent() {
                     renderer.set_background(zgx::scene::Color(0, 0, 0, 0));
                 } else if let Some(background) = self.applied_background {
@@ -3422,8 +3582,12 @@ impl Host {
         );
         // Left maximized, it opens so (`frame_autosave`).
         self.state.maximized |= placed.maximized;
-        let radius =
-            crate::window_chrome::apply(&window, self.options.titlebar, self.options.glass);
+        let radius = crate::window_chrome::apply(
+            &window,
+            self.options.titlebar,
+            self.options.glass,
+            self.options.caption_height,
+        );
         // Opened zoomed: its buttons where the zoomed title bar has them.
         let zoom = self.context.ui.zoom();
         if zoom != 1. {
@@ -3482,6 +3646,9 @@ impl Host {
                 crate::window_chrome::CaptionHost::new(&window, &self.context.ui, move || {
                     let _ = proxy.send_event(Event::Wake(token));
                 });
+            if let Some(caption) = &self.caption {
+                caption.set_fixed_size(fixed_size(&self.options));
+            }
         }
         #[cfg(target_os = "linux")]
         {
@@ -3544,6 +3711,8 @@ impl Host {
         crate::popup_window::set_zoom(window.id(), self.context.ui.zoom());
         self.scale_factor = self.content_scale();
         renderer.set_scale_factor(self.scale_factor as f32);
+        #[cfg(target_os = "macos")]
+        renderer.set_zoom(self.context.ui.zoom());
         self.context
             .ui
             .scene
@@ -3753,6 +3922,20 @@ impl Host {
         self.draw_hidden = false;
         drawn
     }
+    /// Whether the size limits now make the window one of fixed size: its
+    /// caption shows no Maximize and answers no resize bands.
+    #[cfg(windows)]
+    fn size_limits_changed(&mut self) {
+        if let Some(caption) = &self.caption {
+            caption.set_fixed_size(fixed_size(&self.options));
+        }
+        if let Some(window) = &self.window {
+            self.context
+                .window_info
+                .refresh(window, self.options.titlebar);
+            window.request_redraw();
+        }
+    }
     fn command(&mut self, command: WindowCommand) {
         self.state.apply(&mut self.options, &command);
         if matches!(command, WindowCommand::Title(_)) {
@@ -3813,6 +3996,8 @@ impl Host {
                 if let Some(appearance) = theme.or_else(|| window.theme().map(appearance_of)) {
                     self.context.ui.theme().set_system_appearance(appearance);
                 }
+                // What is drawn for the window's own (Windows' caption buttons).
+                window.request_redraw();
             }
             WindowCommand::Decorations(value) => window.set_decorations(value),
             WindowCommand::PointerPassthrough(value) => {
@@ -3821,10 +4006,14 @@ impl Host {
             WindowCommand::Level(level) => window.set_window_level(level.winit()),
             WindowCommand::Shadow(value) => crate::window_info::set_shadow(window, value),
             WindowCommand::MaxSize(value) => {
-                window.set_max_inner_size(value.map(|(w, h)| LogicalSize::new(w, h)))
+                window.set_max_inner_size(value.map(|(w, h)| LogicalSize::new(w, h)));
+                #[cfg(windows)]
+                self.size_limits_changed();
             }
             WindowCommand::MinSize(value) => {
-                window.set_min_inner_size(value.map(|(w, h)| LogicalSize::new(w, h)))
+                window.set_min_inner_size(value.map(|(w, h)| LogicalSize::new(w, h)));
+                #[cfg(windows)]
+                self.size_limits_changed();
             }
             WindowCommand::Drag => {
                 #[cfg(target_os = "macos")]
@@ -4167,9 +4356,10 @@ impl Host {
                 | WindowEvent::ScaleFactorChanged { .. }
         ) && let Some(window) = &self.window
         {
+            let held = self.chrome_held();
             self.context
                 .window_info
-                .refresh(window, self.options.titlebar);
+                .refresh_holding(window, self.options.titlebar, held);
             self.context
                 .ui
                 .set_popup_screens(crate::popup_window::popup_screens(window));
@@ -4210,16 +4400,13 @@ impl Host {
         match event {
             WindowEvent::CloseRequested => {}
             WindowEvent::Occluded(_) if *RENDER_WHEN_COVERED => {}
-            WindowEvent::Occluded(true) => {
-                // Minimized, or on a Space no longer shown: its menus and
-                // popovers close, as AppKit's do (they would show again
-                // with it, still open).
-                self.context.ui.dismiss_popups();
-                self.context.ui.cancel_interactions();
-                self.native_occluded = true;
-                self.context.ui.set_presented(false);
-                self.presentation.occlude();
-            }
+            // Going into or out of full screen, AppKit counts the window
+            // covered while it animates: it goes on drawing (its content
+            // resizes through the transition, and shows current as it ends),
+            // and is counted covered only if it still is once the transition
+            // is over (`full_screen`).
+            WindowEvent::Occluded(true) if self.in_full_screen_transition() => {}
+            WindowEvent::Occluded(true) => self.occlude(),
             WindowEvent::Occluded(false) => {
                 self.native_occluded = false;
                 self.context
@@ -5038,6 +5225,8 @@ impl Host {
         self.scale_factor = scale;
         if let Some(renderer) = &mut self.renderer {
             renderer.set_scale_factor(scale as f32);
+            #[cfg(target_os = "macos")]
+            renderer.set_zoom(self.context.ui.zoom());
         }
         self.context
             .ui
@@ -6600,7 +6789,7 @@ impl WindowManager {
     /// frame shows rather than on the way to it, at once with no window
     /// about to show one, and after `MENU_BAR_LATEST` in any case.
     #[cfg(target_os = "macos")]
-    fn install_menu_bar(&mut self, event_loop: &ActiveEventLoop) {
+    fn install_menu_bar(&mut self) {
         let Some(latest) = self.menu_bar_due else {
             return;
         };
@@ -6614,18 +6803,29 @@ impl WindowManager {
             return;
         }
         self.menu_bar_due = None;
-        match crate::app_menu::NativeMenu::new(&self.factory.menus()) {
-            Ok(menu) => {
-                menu.install();
-                self.native_menu = Some(menu);
+        // A bar AppKit can't make is said, never the app's end: then the
+        // application and Window menus alone, every Mac app's.
+        if let Err(error) =
+            crate::app_menu::show_menus(&mut self.native_menu, &self.factory.menus())
+        {
+            eprintln!("zgx: the menu bar: {error}; showing the standard menus alone");
+            if let Err(error) = crate::app_menu::show_menus(&mut self.native_menu, &[]) {
+                eprintln!("zgx: the standard menus: {error}");
             }
-            Err(error) => self.fail(event_loop, error),
         }
     }
     fn resumed_turn(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "macos")]
         if let Some(events) = &self._native_events {
             events.install();
+        }
+        // AppKit's full-screen notifications: `WindowContext::full_screen_transition`.
+        #[cfg(target_os = "macos")]
+        {
+            let proxy = self.factory.proxy.clone();
+            crate::window_chrome::watch_full_screen(move || {
+                let _ = proxy.send_event(Event::FullScreen);
+            });
         }
         #[cfg(target_os = "macos")]
         if let Some(menu) = &self.native_menu {
@@ -6704,6 +6904,8 @@ impl WindowManager {
     fn user_event_turn(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Quit => event_loop.exit(),
+            #[cfg(target_os = "macos")]
+            Event::FullScreen => self.apply_full_screen(),
             Event::Application(event, token) => {
                 // The window this brings up takes the launch's token...
                 #[cfg(target_os = "linux")]
@@ -6818,13 +7020,10 @@ impl WindowManager {
                 for host in self.hosts.values_mut() {
                     crate::system_colors::sync(&host.context.ui);
                     crate::scrollers::sync(&host.context.ui);
-                    // The desktop's window buttons may have moved: zgx's
-                    // own, and those an app draws (`WindowInfo::buttons`).
+                    // The desktop's window buttons may have moved.
                     #[cfg(target_os = "linux")]
-                    {
-                        if let Some(caption) = &mut host.caption {
-                            caption.sync(&mut host.context.ui);
-                        }
+                    if let Some(caption) = &mut host.caption {
+                        caption.sync(&mut host.context.ui);
                         if let Some(window) = &host.window {
                             host.context
                                 .window_info
@@ -6863,24 +7062,13 @@ impl WindowManager {
                 let menus = self.factory.menus();
                 let reserved = self.factory.reserved.borrow().clone();
                 // A menu bar still to be made is made from them then.
+                // One AppKit can't make is said and the last good bar kept,
+                // never the app's end; the shortcuts below still follow.
                 #[cfg(target_os = "macos")]
                 if self.menu_bar_due.is_none()
-                    && !self
-                        .native_menu
-                        .as_mut()
-                        .is_some_and(|menu| menu.update_states(&menus))
+                    && let Err(error) = crate::app_menu::show_menus(&mut self.native_menu, &menus)
                 {
-                    let replacement = match crate::app_menu::NativeMenu::new(&menus) {
-                        Ok(menu) => menu,
-                        Err(error) => {
-                            self.fail(event_loop, error);
-                            return;
-                        }
-                    };
-                    // Old menu removes itself from NSApp on drop; install replacement afterwards.
-                    self.native_menu = None;
-                    replacement.install();
-                    self.native_menu = Some(replacement);
+                    eprintln!("zgx: the menu bar: {error}; the last one stays");
                 }
                 for host in self.hosts.values_mut() {
                     host.context.menu_model.set(menus.clone());
@@ -7066,6 +7254,10 @@ impl WindowManager {
         id: WindowId,
         event: WindowEvent,
     ) {
+        // AppKit's full-screen notifications first: a will comes inside the
+        // call that starts the transition, before winit's resizes for it.
+        #[cfg(target_os = "macos")]
+        self.apply_full_screen();
         // A popup window's input goes to its parent's host (X11).
         #[cfg(target_os = "linux")]
         if crate::popup_window::route(id, &event) {
@@ -7083,7 +7275,7 @@ impl WindowManager {
             && matches!(&event, WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed())
         {
             self.menu_bar_due = Some(std::time::Instant::now());
-            self.install_menu_bar(event_loop);
+            self.install_menu_bar();
             if crate::app_menu::offer_current_key() {
                 return;
             }
@@ -7128,7 +7320,26 @@ impl WindowManager {
             self.carry_drag(token);
         }
     }
+    /// AppKit's full-screen notifications queued since the last turn
+    /// (`window_chrome::watch_full_screen`), each to its window's host, in
+    /// the order they came. Applied as each turn begins, so a will goes
+    /// before the resizes it brings; nothing queued, nothing done.
+    #[cfg(target_os = "macos")]
+    fn apply_full_screen(&mut self) {
+        for (number, phase, duration, seq) in crate::window_chrome::take_full_screen() {
+            let Some(host) = self
+                .hosts
+                .values_mut()
+                .find(|host| host.window_number == Some(number))
+            else {
+                continue;
+            };
+            host.full_screen(phase, duration, seq);
+        }
+    }
     fn about_to_wait_turn(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        self.apply_full_screen();
         // A close request must terminate even while native surfaces are suspended.
         let closed: Vec<_> = self
             .hosts
@@ -7167,7 +7378,7 @@ impl WindowManager {
             return;
         }
         #[cfg(target_os = "macos")]
-        self.install_menu_bar(event_loop);
+        self.install_menu_bar();
         // macOS's Reduce motion, Increase contrast or Reduce transparency
         // changed: every window's themes follow at once.
         if crate::system_colors::display_options_changed() {
@@ -7978,6 +8189,25 @@ impl WindowCursor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_same_smallest_and_largest_size_is_a_fixed_size() {
+        let options = |min, max| super::WindowOptions {
+            min_size: min,
+            max_size: max,
+            ..Default::default()
+        };
+        assert!(!super::fixed_size(&options(None, None)));
+        assert!(!super::fixed_size(&options(Some((400., 300.)), None)));
+        assert!(!super::fixed_size(&options(
+            Some((400., 300.)),
+            Some((800., 600.))
+        )));
+        assert!(super::fixed_size(&options(
+            Some((400., 300.)),
+            Some((400., 300.))
+        )));
+    }
+
     /// A turn's pointer moves come as one, its last (Linux, where every
     /// motion a mouse reports arrives, up to 1000 a second): a burst of a
     /// thousand is handled once, at the last place.
@@ -8515,6 +8745,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             activation: Rc::default(),
             menus: Rc::new(RefCell::new(Vec::new())),
+            menus_left_out: Rc::default(),
             reserved: Rc::default(),
             pending: Rc::new(RefCell::new(VecDeque::new())),
             next: Rc::new(Cell::new(1)),
@@ -8670,6 +8901,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             activation: Rc::default(),
             menus: Rc::new(RefCell::new(Vec::new())),
+            menus_left_out: Rc::default(),
             reserved: Rc::default(),
             pending: Rc::new(RefCell::new(VecDeque::new())),
             next: Rc::new(Cell::new(1)),
@@ -8798,6 +9030,7 @@ mod tests {
             application_id: None,
             activation: Rc::default(),
             menus: Rc::new(RefCell::new(Vec::new())),
+            menus_left_out: Rc::default(),
             reserved: Rc::default(),
             pending: Rc::new(RefCell::new(VecDeque::new())),
             next: Rc::new(Cell::new(1)),
@@ -8873,6 +9106,7 @@ mod tests {
             application_id: None,
             activation: Rc::default(),
             menus: Rc::new(RefCell::new(Vec::new())),
+            menus_left_out: Rc::default(),
             reserved: Rc::default(),
             pending: Rc::new(RefCell::new(VecDeque::new())),
             next: Rc::new(Cell::new(1)),
@@ -8940,6 +9174,7 @@ mod tests {
             application_id: None,
             activation: Rc::default(),
             menus: Rc::new(RefCell::new(Vec::new())),
+            menus_left_out: Rc::default(),
             reserved: Rc::default(),
             pending: Rc::new(RefCell::new(VecDeque::new())),
             next: Rc::new(Cell::new(1)),

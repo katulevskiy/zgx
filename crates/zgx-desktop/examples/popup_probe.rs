@@ -76,6 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // is resized in place, never shown anew (on Wayland,
             // `xdg_popup.reposition`: run with `WAYLAND_DEBUG=1` to see).
             let grow = std::env::var_os("POPUP_PROBE_GROW").is_some();
+            let size = cx.ui.signal((200_f32, 120_f32));
             // `POPUP_PROBE_TINT=ms`: that popover opens by itself and
             // changes its color a step every `ms` (2: as fast as a mouse's
             // moves come) at one size, as a popup whose content alone
@@ -84,29 +85,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tint = std::env::var("POPUP_PROBE_TINT")
                 .ok()
                 .map(|ms| ms.parse::<u64>().unwrap_or(2));
-            let size = cx.ui.signal((200_f32, 120_f32));
             let shade = cx.ui.signal(0_u32);
-            let popover_shown = grow || tint.is_some();
-            let popup = if popover_shown || std::env::var_os("POPUP_PROBE_POPOVER").is_some() {
-                popover("Details", open.clone(), anchor)
-                    .reactive_style({
+            let popup =
+                if grow || tint.is_some() || std::env::var_os("POPUP_PROBE_POPOVER").is_some() {
+                    let tinted = tint.is_some();
+                    let popover = popover("Details", open.clone(), anchor).reactive_style({
                         let (size, shade) = (size.clone(), shade.clone());
                         move || {
                             let (w, h) = size.get();
-                            let step = shade.get() % 64;
-                            Styles::new()
-                                .w(w)
-                                .h(h)
-                                .bg(rgb(0x4a3768 + (step << 16) + (step << 8)))
+                            let styles = Styles::new().w(w).h(h);
+                            if tinted {
+                                let step = shade.get() % 64;
+                                styles.bg(rgb(0x4a3768 + (step << 16) + (step << 8)))
+                            } else {
+                                styles
+                            }
                         }
-                    })
-                    .arrow(8.)
-            } else {
-                menu("File", open.clone(), anchor)
-                    .w(200.)
-                    .p(5.)
-                    .children(items)
-            };
+                    });
+                    // Its colour stays put but for the tint: its arrow takes
+                    // the panel's styles as it mounts, not a reactive style's.
+                    let popover = if tinted {
+                        popover
+                    } else {
+                        popover.bg(rgb(0x4a3768))
+                    };
+                    popover.arrow(8.)
+                } else {
+                    menu("File", open.clone(), anchor)
+                        .w(200.)
+                        .p(5.)
+                        .children(items)
+                };
             let view = cx.render(column().w_full().h_full().p(16.).justify_end().child(popup));
             #[cfg(target_os = "macos")]
             {

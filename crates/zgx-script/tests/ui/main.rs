@@ -7,6 +7,8 @@
 mod components;
 #[path = "../container_queries.rs"]
 mod container_queries;
+#[path = "../decision.rs"]
+mod decision;
 #[path = "../display_contents.rs"]
 mod display_contents;
 #[path = "../driver.rs"]
@@ -29,6 +31,8 @@ mod grid_tracks;
 mod held_modifiers;
 #[path = "../hit_target.rs"]
 mod hit_target;
+#[path = "../host_top_layer.rs"]
+mod host_top_layer;
 #[path = "../i18n_script.rs"]
 mod i18n_script;
 #[path = "../idle_gc.rs"]
@@ -51,6 +55,8 @@ mod list_edges;
 mod list_focus_scroll;
 #[path = "../list_in_easing_box.rs"]
 mod list_in_easing_box;
+#[path = "../list_in_scroll.rs"]
+mod list_in_scroll;
 #[path = "../list_tab_rows.rs"]
 mod list_tab_rows;
 #[path = "../markdown_lazy.rs"]
@@ -71,6 +77,8 @@ mod scene3d;
 mod scene3d_off;
 #[path = "../script_crashes.rs"]
 mod script_crashes;
+#[path = "../sealed.rs"]
+mod sealed;
 #[path = "../selection.rs"]
 mod selection;
 #[path = "../size_calc.rs"]

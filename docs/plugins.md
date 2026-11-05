@@ -35,6 +35,20 @@ ui.button { id = "add", hook = "toolbar.add", "Add", on_click = add }
 ui.button { id = "clear", hook = false, "Clear done", on_click = ui.action("clear_done") }
 ```
 
+**Keep the host's own controls on top.** A view a host composes around the app's (`render`) can hold `modal(label, open).top_layer()` (`View::top_layer`): a layer filling the window, above whatever a plugin opens (`ui.modal`, `ui.layer`, a popover, a fixed node at any `z`), and live under them, so its controls take the pointer while a plugin's modal is up. The pointer passes through it but for its controls, and it takes no focus. A script's `z` orders its element among its siblings and can't reach it.
+
+**Decision controls.** What only the person may answer (tool approval, sign-in, keeping a template) goes in `ui.decision { key, … }` ([overlays](reference/overlays.md#decision)): a plugin can't make one, reach into one, or draw over one.
+
+- Replacing, hiding or disabling an element whose declared tree holds one is refused, and reported in `ScriptHost::contributions` and to the plugin.
+- While one is mounted, a plugin's popups (popovers, menus, tooltips, context menus) stay in the window, under it, not in windows of their own. The app's own popups keep theirs.
+- What a refusal can't see: a builder's output (a component, a row) replaced from above, or a filter of a list's `items` dropping the row. A plugin's own window (`Capability::Windows`) is one too, as nothing in this window can be above another window.
+
+So a host holding a pending decision reads `host.decision_shown(key)`: true while at least half of it shows and no plugin has a window open, followed where read reactively. While it is false, the host shows its own fallback in its top layer. A scrolled-away decision reads false too.
+
+**Sealed regions.** `ui.sealed { … }` is the same for a region, a Settings page. A plugin's own settings page goes in it through `ui.plugin_page { plugin = name }`: the plugin gives it with `ui.contribute("plugin_page", node)`, no other plugin's shows there, and all it draws and opens is cut to that box. See [overlays](reference/overlays.md#sealed).
+
+A module replaced with `ui.override` runs as the app's own code (`Capability::Override` is a trust grant), so none of this holds against it.
+
 Plugins may also target an element by role and name, as the app writes them (`role:button "Add"`, or `"Add"`). That is convenient and the most fragile form; prefer declared hooks.
 
 **Classes and chains.** `.session-row` targets every element with that class (`class = "session-row"`), and a contribution goes beside or in place of each. `#sidebar >> .session-row` targets those inside `#sidebar`, at any depth: each part before a `>>` is an element above the one before it. Parts combine as one element's (`#save .primary`, `role:button "Add"`). A chain is checked as the element mounts, so one in a row of a `ui.each` inside the sidebar matches, and the same class elsewhere doesn't. `ui.filter` takes the same targets.
@@ -46,9 +60,9 @@ Plugins may also target an element by role and name, as the app writes them (`ro
 | | call | needs |
 |---|---|---|
 | add beside an element | `ui.contribute { target, before = node }`, `after = node` | nothing, unless the host asks a capability for that target (`expose_hook`) or for every contribution (`require_contribution_capability`) |
-| put a node in its place | `ui.contribute { target, replace = node }` | `Capability::Override(target)` |
-| pass a prop through a function | `ui.filter { target, text = fn, … }` (text, label, hidden, disabled, tooltip, items, order) | `Capability::Override(target)` |
-| replace an app module | `ui.override { module = "@app/…", with = "./file" }` | `Capability::Override(module)`, a trust grant (below) |
+| put a node in its place | `ui.contribute { target, replace = node }` | `Capability::OverrideElement(target)` |
+| pass a prop through a function | `ui.filter { target, text = fn, … }` (text, label, hidden, disabled, tooltip, items, order) | `Capability::OverrideElement(target)` |
+| replace an app module | `ui.override { module = "@app/…", with = "./file" }` | `Capability::OverrideModule(module)`, a trust grant (below) |
 | add to a slot the app made | `ui.contribute(name, node)` | nothing, unless the host asks a capability for every contribution (`require_contribution_capability`) |
 
 From the focus plugin:
@@ -77,20 +91,56 @@ What a plugin adds reads what the app provides above where it lands (`provide`, 
 Capabilities are what the host grants each plugin (`Plugin { name, entry, grants }`), and the example's host grants them per plugin:
 
 ```rust
-Plugin { name: "focus".into(), entry, grants: vec![Capability::Override("#tasks".into())] },
+Plugin { name: "focus".into(), entry, grants: vec![Capability::OverrideElement("#tasks".into())] },
 Plugin { name: "stamps".into(), entry, grants: vec![
-    Capability::Override("#empty".into()),
-    Capability::Override("@app/components/task_row".into()),
+    Capability::OverrideElement("#empty".into()),
+    Capability::OverrideModule("@app/components/task_row".into()),
 ] },
 ```
 
-**`Override` on an element** lets a plugin change what that element shows: its replacement or its filtered props. The plugin's code still runs in its own VM, seeing only what it was given. It can change how the element looks and reads, but not reach the app's state or handlers. Grant it for elements whose content you are willing to let the plugin decide.
+**`OverrideElement`** lets a plugin change what that element shows: its replacement or its filtered props. The plugin's code still runs in its own VM, seeing only what it was given. It can change how the element looks and reads, but not reach the app's state or handlers. Grant it for elements whose content you are willing to let the plugin decide.
 
-**`Override` on a module is a trust grant.** The replacement runs in the app's VM as the app's own code, with everything the app's scripts may do: its state, its actions, its packages. That is why stamps' row can `require("@app-original/components/task_row")` (the module it replaces; only the replacement may reach it) and `require("@kit/badge")`. Grant `Override("@app/…")` as you would install the plugin's code into the app, and `Override("*")` only to a plugin you trust with the whole app.
+**`OverrideModule` is a trust grant.** The replacement runs in the app's VM as the app's own code, with everything the app's scripts may do: its state, its actions, its packages. That is why stamps' row can `require("@app-original/components/task_row")` (the module it replaces; only the replacement may reach it) and `require("@kit/badge")`. Grant `OverrideModule("@app/…")` as you would install the plugin's code into the app, and `Override("*")` only to a plugin you trust with the whole app.
+
+`"*"` stands for any target in `OverrideElement("*")`, and for any module in `OverrideModule("*")`, which trusts the plugin with the whole app. The two are apart so that a plugin trusted to restyle elements isn't trusted with the app's code. The older `Override` reads by what it names: a target or `"*"` is an element's, `"@app/…"` that module's.
+
+**What a plugin may call itself.** A plugin offers only slots of its own, `ui.slot("<plugin>.…")`: an app's slot, or another plugin's, can't be posed as to take what is contributed there. Its commands' ids are already its own (`<plugin>/…`). `host.reserve_prefix("acme")` keeps `acme` and `acme.…` for the app's own scripts, whatever a plugin is named or granted: neither a slot nor a command `id` so named.
+
+**A shortcut with no modifier** (`k`, `enter`, `f5`, or Shift alone on a character) would be taken from every field, page and terminal, so a plugin's takes `Capability::Named("zgx.command.bare_keys")`. Without it `ui.command { key = "k" }` is an error; one a state or function says is dropped as it reads so, reported in `host.dropped_shortcuts()`.
+
+**The app's own scripts under a guard.** `host.guard(|kind, name| …)` is asked before the app's VM leaves the interface, each time, and an `Err` stops it with that text as the script's error: for previewing someone's template in the app's own VM. Plugins aren't asked; they reach what their grants say.
+
+| `GuardKind` | Asked before | `name` |
+| --- | --- | --- |
+| `Action`, `AsyncAction`, `Function` | a host action, async action or function | its name |
+| `Fetch` | `ui.fetch`; refused, its promise rejects | the URL |
+| `Picture` | a remote picture (`ui.image`, `ui.svg`, `bg_image`) | the URL |
+| `Socket` | `ui.socket`, each time it opens | the URL |
+| `Term` | `ui.term`, which raises when refused: nothing starts | the command, or the login shell |
+| `TermInput` | a terminal's `:input`, `:paste`, `:binding` | the session's id |
+| `Web` | a page: `src`, `:load`, `:html`, `html`, and each navigation the platform starts | the URL (`html`'s base, or `about:blank`) |
+| `Clipboard` | `ui.clipboard` | `read`, `write`, `read_image`, `write_image` |
+| `Dialog` | `ui.open_files`, `ui.save_file`, `ui.open_folder`, a download's `d:ask()` | the function (`ask`) |
+| `File` | `ui.read_file`, `ui.write_file` | the path |
+| `Folder` | `ui.remembered_folder`; a folder's `:read`, `:write`, `:file` | the key, or the path |
+| `Notification` | `ui.notify`, `ui.badge` | the title, or `badge` |
+| `OpenLink` | a link in text opening, on a click or its Open Link item | the URL |
+| `Window` | `ui.window`, which raises when refused: nothing opens | its `id` |
+| `Persist` | `ui.persist`; refused, it starts from what is saved, and its writes are held | the key |
+
+A refused `src` leaves the page where it was (blank, the first time), and a refused navigation is cancelled and reported. Redirects, links, forms, a page's script setting `location`, and history go through the platform's navigation policy, which WebKit, WebKitGTK and WebView2 ask before each. **What no platform shows it:** what a page loaded on its own fetches once it is there (scripts, pictures, `fetch`, WebSockets, workers), and in-page steps (`history.pushState`, and on some platforms a `#fragment`). To keep a preview off the network, refuse the page, or give it content that has nothing to reach.
+
+A script in the app's VM shares the app's `ui.persist` keys, so a preview could overwrite what the app keeps: refuse `Persist` and it looks as the app does, starting from what is saved, while what it writes is held in memory. `host.keep_held_state()` saves those values when the person keeps what they previewed; `host.drop_held_state()`, or quitting, lets them go. **A refused `Persist` still reads:** a preview sees every saved value by its key, and a remote picture's URL, if `Picture` is allowed, can carry what it reads off the machine. Keep secrets out of `ui.persist`, or refuse `Picture`, where that matters. `OpenLink` is asked of any link in the host's view, a plugin's too, if the host had a guard as its view was made; one set later isn't asked for links.
+
+**Not asked of the guard:** `ui.state`, which a preview in the app's VM shares with the app, in memory; a web view's `:run_js` and `:open_devtools`, which reach only a page already allowed, though its script can then fetch; `ui.image` and `ui.svg` of a local file, which read it to draw it. A script can't read those pixels back (a bitmap says only its size, and `:snapshot` gives only a `src`), but `ui.image_size` and `on_load` tell any picture's size, and so whether it exists, and it shows on screen.
 
 **Where a plugin can put something, and what it can read there**, is `host.elements(&ui, &handle)`: the app's named elements (ids, classes, hooks) grouped by the elements that `provide` context, the app's root outermost. Each group gives a selector that reaches it (its id, or its classes inside the nearest element with one: `#sidebar >> .session-row`), the context names it provides and those it inherits, and its named elements down to the next group. Rows a list repeats are one group with a count; a private element is listed with nothing inside it; names the source declares that aren't showing (a page not open) are listed `mounted: false`. `zgx inspect elements` (MCP `zgx_elements`) gives the same, a line each and then as JSON. The mounted tree is kept only while plugins are loaded; without, it lists the source's names (`live: false`).
 
 **What each contribution does now** is `host.contributions()`: for each `ui.contribute { target }` and `ui.filter`, in the order made, the plugin, its target, its place (`before`, `after`, `replace`, `filter`), how many elements it applies at now, and its latest error. A target matching nothing reads `matches: 0`, so a host can say "not shown here" without reading the plugin's source. The count follows the interface: an element a `ui.show` hides drops out, and one in each row of a list counts a match a row. `zgx inspect contributions` (MCP `zgx_contributions`) gives the same, a line each and then as JSON. A plugin command whose shortcut the app's commands (or an earlier plugin's) hold, spelled the same or not, is published without it, and the list says so after the contributions: place `shortcut`, the command's id as its target, and an error naming the key, why ("taken by the app") and the command that holds it. `host.dropped_shortcuts()` gives the same typed (`DroppedShortcut { plugin, command, key, reason, holder }`), to read as `host.commands()` changes. Without plugins the list is empty and nothing is counted.
+
+**Where it shows now** is `host.contribution_bounds("plugin")`: a box in the window for each thing it has mounted in a slot or before, after or in place of an element (what a `ui.filter` changes stays the app's own), for a host to say whose a control is or outline it.
+
+**Uninstalling a plugin**, `host.forget_state("plugin:<name>")` leaves nothing of its state: its `ui.state` and `ui.persist` values, what waits to be saved and its saved files. Call it once the plugin is no longer loaded (`set_plugins` without it, then `reload`); installed again, it starts from its `initial`.
 
 The host can also ask a capability before anyone adds beside a target: `host.expose_hook("#checkout", Some(Capability::Named("payments".into())))`. To lock every contribution down at once (slots, and beside any `#id` or hook), `host.require_contribution_capability(Capability::Named("contribute".into()))` makes each take that capability; `expose_hook(target, None)` (`"slot:name"` for a slot) opens one again.
 
@@ -131,7 +181,7 @@ An app run with `zgx run` has no Rust of its own. Its `zgx.json` sets both sides
   - `actions` names what plugins may call.
   - `hooks` maps a target, or an `@app/…` module, to `"override"` when a plugin may replace or filter it. Adding before and after is open, so `"open"` changes nothing. `"*": "override"` offers every target.
 - **`plugins`** names each plugin's folder (its `init.luau`) or file, and its `allow` list:
-  - `shared:<key>`, `action:<name>` and `override:<target>` for what `expose` offers, and `package:<name>` for a package in `packages` (lent below);
+  - `shared:<key>`, `action:<name>` and `override:<target>` for what `expose` offers (`override:*` is every element; a module is named, `override:@app/…`, or `override-module:*` for all of them), and `package:<name>` for a package in `packages` (lent below);
   - `fetch`, `clipboard`, `files`, `folders`, `terminals`, `web` and `windows` for the sandbox. `folders` is `ui.open_folder`, and the host can refuse it to every script (`ScriptHost::refuse_folders`).
 - **A grant beyond what's exposed is an error as the app loads**, naming the plugin and the grant: ``plugin `focus` is allowed `action:complete`, which the app doesn't expose (add "complete" to expose.actions)``. So is an unknown grant or a missing path.
 - **The app's script defines its actions** with `ui.actions`. Plugins call them as they call a Rust host's: `ui.invoke("complete", id)`, or `ui.action("complete", id)` as a handler. The app calls them the same way. A plugin can't define actions.

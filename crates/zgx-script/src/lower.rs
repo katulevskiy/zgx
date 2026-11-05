@@ -49,15 +49,25 @@ pub(crate) struct Assets {
     files: std::cell::RefCell<HashMap<String, (std::path::PathBuf, Option<std::time::SystemTime>)>>,
     /// Where they are read from: the disk, or the app's bundle.
     source: std::cell::Cell<Option<crate::Files>>,
-    /// Remote sources (`https://…`) by URL: fetched once, whoever shows
-    /// them; what shows one follows its status (`LOADING`, `READY`, `FAILED`).
+    /// Remote sources (`https://…`) by `remote_key`: fetched once by each
+    /// asking (the app, or a plugin), so each request is its own to allow, and
+    /// what comes is shared (`images`, `svgs`). What shows one follows its
+    /// status (`LOADING`, `READY`, `FAILED`).
     remote: std::cell::RefCell<HashMap<String, zgx::reactive::Signal<u8>>>,
-    /// Failed remote sources: when, how many times in a row, why. Asked
-    /// for again after a backoff, they're fetched again (as a browser
-    /// retries a broken image when a new element shows it).
+    /// Failed remote sources by `remote_key`: when, how many times in a row,
+    /// why. Asked for again after a backoff, they're fetched again (as a
+    /// browser retries a broken image when a new element shows it). A plugin's
+    /// failure is its own: refused by the app's policy, or without the proxy
+    /// the app's requests take, it holds up no one else showing the URL.
     failed: std::cell::RefCell<HashMap<String, Failure>>,
     /// The host's tasks and transport, which remote sources go through.
-    links: std::cell::RefCell<Option<(Rc<crate::timers::Timers>, crate::calls::SharedFetcher)>>,
+    links: std::cell::RefCell<
+        Option<(
+            Rc<crate::timers::Timers>,
+            crate::calls::SharedFetcher,
+            crate::fetch_policy::SharedPolicy,
+        )>,
+    >,
     /// Images the host made (`ScriptHost::image`), as `host:<name>`
     /// sources: what shows one follows its version.
     hosted: std::cell::RefCell<HashMap<String, zgx::reactive::Signal<u64>>>,
@@ -303,8 +313,9 @@ impl Assets {
         &self,
         timers: Rc<crate::timers::Timers>,
         fetcher: crate::calls::SharedFetcher,
+        policy: crate::fetch_policy::SharedPolicy,
     ) {
-        *self.links.borrow_mut() = Some((timers, fetcher));
+        *self.links.borrow_mut() = Some((timers, fetcher, policy));
     }
     pub(crate) fn set_files(&self, files: crate::Files) {
         self.source.set(Some(files));
@@ -465,7 +476,52 @@ impl Hooks {
             .into_iter()
             .map(|at| &self.all[at])
             .filter(|hook| (by_name || hook.target.text.is_none()) && targets(&hook.target, node))
+            .filter(|hook| !removes_decision(hook, node))
             .collect()
+    }
+}
+/// Whether `hook` would take away a decision control `node` declares
+/// (`ui.decision`) by replacing, hiding or disabling it: it does nothing
+/// then, and the plugin is told. What only a builder knows of is for
+/// `ScriptHost::decision_shown`.
+fn removes_decision(hook: &crate::node::HookContribution, node: &Node) -> bool {
+    use crate::node::{Adds, Filtered, Place};
+    let removes = match &hook.adds {
+        Adds::Node(place, _) => *place == Place::Replace,
+        Adds::Filters(filters) => filters
+            .iter()
+            .any(|(what, _)| matches!(what, Filtered::Hidden | Filtered::Disabled)),
+    };
+    if !removes || !holds_decision(node) {
+        return false;
+    }
+    if hook.stats.error.borrow().is_none() {
+        let message = format!(
+            "ui.contribute {{ target = \"{}\" }}: refused, it holds a decision control \
+             (ui.decision), which no plugin removes",
+            hook.target_text()
+        );
+        *hook.stats.error.borrow_mut() = Some(message.clone());
+        if let Some(vm) = hook.vm.upgrade() {
+            vm.report(mlua::Error::runtime(message));
+        }
+    }
+    true
+}
+/// Whether `node`'s declared tree has a decision control in it.
+fn holds_decision(node: &Node) -> bool {
+    if matches!(node.kind, Kind::Decision(_)) || node.children.iter().any(|c| holds_decision(c)) {
+        return true;
+    }
+    match &node.kind {
+        Kind::Show {
+            then, otherwise, ..
+        } => holds_decision(then) || otherwise.as_deref().is_some_and(holds_decision),
+        Kind::Switch { cases, default, .. } => {
+            cases.iter().any(|(_, case)| holds_decision(case))
+                || default.as_deref().is_some_and(holds_decision)
+        }
+        _ => false,
     }
 }
 /// Whether `node` is what `target` names, by what is known of it before it
@@ -636,8 +692,174 @@ fn contributed_now(
         Some(own) => format!("{own}, {from}"),
         None => format!("From the plugin {owner}"),
     };
-    view.accessible_description(described)
+    plugin_view(view.accessible_description(described), low)
 }
+/// `view`, a plugin's among the app's: its popups stay in the window while a
+/// decision control shows (`Decisions::showing`).
+fn plugin_view(view: View, low: &Lowering) -> View {
+    zgx::compose::provide(
+        zgx::compose::PopupsInWindow(low.decisions.showing.clone()),
+        view,
+    )
+}
+/// Whether `node` is a plugin's, not the application's.
+fn plugin_owned(node: &Node) -> bool {
+    node.owner.upgrade().is_some_and(|vm| {
+        crate::node::env(&vm.lua).is_ok_and(|env| matches!(&*env.grants, crate::Grants::Only(_)))
+    })
+}
+/// Whether a decision key's control shows, and how many are mounted.
+type DecisionKey = (Signal<bool>, u32);
+/// The decision controls mounted (`ui.decision`), for
+/// `ScriptHost::decision_shown`, and across loads.
+pub(crate) struct Decisions {
+    runtime: zgx::reactive::Runtime,
+    keys: std::cell::RefCell<HashMap<Rc<str>, DecisionKey>>,
+    /// Whether one is mounted, a plugin's popups held in the window then.
+    showing: Signal<bool>,
+}
+impl Decisions {
+    pub(crate) fn new(runtime: &zgx::reactive::Runtime) -> Self {
+        Self {
+            runtime: runtime.clone(),
+            keys: Default::default(),
+            showing: runtime.signal(false),
+        }
+    }
+    /// Whether at least half of decision `key` shows (false until it does).
+    pub(crate) fn shown(&self, key: &str) -> Signal<bool> {
+        let mut keys = self.keys.borrow_mut();
+        if let Some((shown, _)) = keys.get(key) {
+            return shown.clone();
+        }
+        let shown = self.runtime.signal(false);
+        keys.insert(key.into(), (shown.clone(), 0));
+        shown
+    }
+    fn mounted(self: &Rc<Self>, key: &Rc<str>) -> impl Drop + 'static {
+        struct Mounted(Rc<Decisions>, Rc<str>);
+        impl Drop for Mounted {
+            fn drop(&mut self) {
+                let mut keys = self.0.keys.borrow_mut();
+                if let Some((shown, count)) = keys.get_mut(&self.1) {
+                    *count -= 1;
+                    if *count == 0 {
+                        shown.set(false);
+                    }
+                }
+                let any = keys.values().any(|(_, count)| *count > 0);
+                drop(keys);
+                if !any {
+                    self.0.showing.set(false);
+                }
+            }
+        }
+        self.shown(key);
+        self.keys.borrow_mut().get_mut(key).expect("just made").1 += 1;
+        if self.showing.with_untracked(|on| !*on) {
+            self.showing.set(true);
+        }
+        Mounted(self.clone(), key.clone())
+    }
+}
+/// What a slot shows for one contribution. Apart from `kind_view`, as few
+/// elements are a slot.
+#[cold]
+#[inline(never)]
+fn slot_item(n: &Rc<Node>, context: Option<&Value>, low: &Rc<Lowering>) -> View {
+    let view = match context {
+        // What is contributed here hears it (`props.slot`).
+        Some(context) => zgx::compose::provide(SlotContext(context.clone()), lower(n, low)),
+        None => lower(n, low),
+    };
+    match plugin_owned(n) {
+        true => plugin_view(view, low),
+        false => view,
+    }
+}
+/// `ui.decision`: what it holds lowered out of plugins' reach, hoisted over
+/// the box in flow its own props style.
+#[cold]
+#[inline(never)]
+fn decision(node: &Node, held: &crate::node::Decision, low: &Rc<Lowering>) -> View {
+    let crate::node::Decision {
+        key,
+        label,
+        content,
+        sealed,
+    } = held;
+    let has = |props: &[Prop]| node.props.iter().any(|(prop, _)| props.contains(prop));
+    let fills = (
+        has(&[Prop::W, Prop::WFull, Prop::Size]),
+        has(&[Prop::H, Prop::HFull, Prop::Size]),
+    );
+    // Lowered without what plugins add, then and whenever a part of it builds
+    // later (a row, a branch, a component).
+    let alone = Rc::new(Lowering {
+        slots: match *sealed {
+            // Under a name no script can write: no `ui.slot` shows them.
+            true => Some(low.slots.get(PLUGIN_PAGE).cloned().unwrap_or_default()),
+            false => low.slots.get(PAGES).cloned(),
+        }
+        .map(|pages| [(PAGES.to_owned(), pages)].into())
+        .unwrap_or_default(),
+        hooks: None,
+        sealed: Default::default(),
+        decisions: low.decisions.clone(),
+        actions: low.actions.clone(),
+        elements: low.elements.clone(),
+        runtime: low.runtime.clone(),
+        assets: low.assets.clone(),
+        inspector: low.inspector.clone(),
+        depth: std::cell::Cell::new(low.depth.get()),
+        #[cfg(feature = "components")]
+        commands: low.commands.clone(),
+    });
+    let mut held = column().children(content.iter().map(|child| lower(child, &alone)));
+    if fills.0 {
+        held = held.w_full();
+    }
+    if fills.1 {
+        held = held.h_full();
+    }
+    let decisions = low.decisions.clone();
+    let key = key.clone();
+    zgx::compose::hoist(
+        &low.runtime,
+        div(),
+        held,
+        label.as_str(),
+        fills,
+        Some(low.decisions.shown(&key)),
+    )
+    .on_mount(move |handle| handle.retain(decisions.mounted(&key)))
+}
+/// `ui.plugin_page`: what `plugin` alone gave its page, confined to this box:
+/// clipped, its portals with it, and its popups in the window. Lowered as the
+/// rest of its region, with no hook of another plugin's on it.
+#[cold]
+#[inline(never)]
+fn plugin_page(plugin: &Rc<str>, node: &Node, low: &Rc<Lowering>) -> View {
+    let Some(pages) = low.slots.get(PAGES) else {
+        if let Some(vm) = node.owner.upgrade() {
+            vm.report(mlua::Error::runtime(
+                "ui.plugin_page: it shows in a ui.sealed region alone",
+            ));
+        }
+        return div();
+    };
+    let page = column().w_full().h_full().children(
+        pages
+            .iter()
+            .filter(|(owner, _, _)| **owner == **plugin)
+            .map(|(_, n, stats)| counted(lower(n, low), stats)),
+    );
+    div().child(zgx::compose::confined(plugin_view(page, low)))
+}
+/// The slot a plugin's page goes to: `ui.contribute("plugin_page", …)`.
+const PLUGIN_PAGE: &str = "plugin_page";
+/// Where a `ui.sealed` region holds them, for the `ui.plugin_page`s in it.
+const PAGES: &str = "\0plugin_pages";
 /// A component inside a `private` element: built later, as it mounts,
 /// and still sealed from plugins then.
 #[cold]
@@ -1122,6 +1344,7 @@ pub(crate) struct Lowering {
     /// How many `private` elements the lowering running now is inside:
     /// nothing in them is a plugin's target.
     pub sealed: std::cell::Cell<u32>,
+    pub decisions: Rc<Decisions>,
     pub actions: Actions,
     pub elements: Rc<crate::element::Elements>,
     pub runtime: zgx::reactive::Runtime,
@@ -2311,16 +2534,19 @@ fn rebuilt(node: &Rc<Node>, low: &Rc<Lowering>) -> Rc<Node> {
 /// `view`, where a contribution applies, counted among its live matches
 /// (`ScriptHost::contributions`) while it is mounted.
 fn counted(view: View, stats: &Rc<crate::node::ContributionStats>) -> View {
-    struct Live(Rc<crate::node::ContributionStats>);
+    struct Live(Rc<crate::node::ContributionStats>, zgx::scene::NodeId);
     impl Drop for Live {
         fn drop(&mut self) {
             self.0.live.set(self.0.live.get().saturating_sub(1));
+            self.0.mounted.borrow_mut().retain(|h| h.node() != self.1);
         }
     }
     let stats = stats.clone();
     view.on_mount(move |handle| {
         stats.live.set(stats.live.get() + 1);
-        handle.retain(Live(stats));
+        stats.mounted.borrow_mut().push(handle.clone());
+        let node = handle.node();
+        handle.retain(Live(stats, node));
     })
 }
 /// `view`, an element plugins filter, counted for each filtering script.
@@ -2396,13 +2622,30 @@ fn web_view_of(spec: &crate::node::WebSpec, vm: &Rc<Vm>, low: &Rc<Lowering>) -> 
     let view = match (&spec.src, &spec.html) {
         (Some(src), _) => {
             let (src, vm) = (resolve_owned(src), vm.clone());
+            // Refused, it stays where it is (blank, the first time).
+            let mut shown = "about:blank".to_owned();
             web_view_src(&web, move || match resolve(&src, Ty::Str, None, &vm) {
-                Some(Lit::Str(url)) => url.to_string(),
+                Some(Lit::Str(url)) => {
+                    match crate::rules::guard(&vm.lua, crate::GuardKind::Web, &url) {
+                        Ok(()) => {
+                            shown = url.to_string();
+                            shown.clone()
+                        }
+                        Err(error) => {
+                            vm.report(error);
+                            shown.clone()
+                        }
+                    }
+                }
                 _ => String::new(),
             })
         }
         (None, Some((html, base))) => {
-            web.load_html(html.clone(), base.as_deref());
+            let name = base.as_deref().unwrap_or("about:blank");
+            match crate::rules::guard(&vm.lua, crate::GuardKind::Web, name) {
+                Ok(()) => web.load_html(html.clone(), base.as_deref()),
+                Err(error) => vm.report(error),
+            }
             web_view(&web)
         }
         (None, None) => web_view(&web),
@@ -3366,15 +3609,11 @@ fn kind_view(
                 .get(name)
                 .into_iter()
                 .flatten()
-                .filter(|(owner, _)| from.as_deref().is_none_or(|from| **owner == *from))
-                .map(|(_, n)| match context {
-                    // What is contributed here hears it (`props.slot`).
-                    Some(context) => {
-                        zgx::compose::provide(SlotContext(context.clone()), lower(n, low))
-                    }
-                    None => lower(n, low),
-                }),
+                .filter(|(owner, _, _)| from.as_deref().is_none_or(|from| **owner == *from))
+                .map(|(_, n, stats)| counted(slot_item(n, context.as_ref(), low), stats)),
         ),
+        Kind::Decision(held) => decision(node, held, low),
+        Kind::PluginPage(plugin) => plugin_page(plugin, node, low),
     }
 }
 
@@ -4435,6 +4674,14 @@ const FAILED: u8 = 2;
 fn backoff(times: u32) -> std::time::Duration {
     std::time::Duration::from_secs((5u64 << times.saturating_sub(1).min(6)).min(300))
 }
+/// Remote `src`'s key in `Assets::remote` and `failed`: its URL for the app,
+/// apart for each plugin (a URL starts `http`, never with this `\0`).
+fn remote_key<'a>(vm: &Vm, src: &'a str) -> std::borrow::Cow<'a, str> {
+    match crate::fetch_policy::caller_of(&vm.lua) {
+        None => src.into(),
+        Some(plugin) => format!("\0{plugin}\0{src}").into(),
+    }
+}
 fn remote_ready(vm: &Rc<Vm>, low: &Lowering, src: &str, svg: bool) -> bool {
     remote_status(vm, low, src, svg) == READY
 }
@@ -4466,14 +4713,25 @@ fn remote_status_in(
         )));
         return FAILED;
     }
-    let existing = assets.remote.borrow().get(src).cloned();
+    let key = remote_key(vm, src);
+    let existing = assets.remote.borrow().get(&*key).cloned();
+    if let Some(status) = &existing {
+        if status.get() != FAILED {
+            return status.get();
+        }
+        let failed = (assets.failed.borrow().get(&*key)).map(|(at, times, _)| (*at, *times));
+        if failed.is_some_and(|(at, times)| at.elapsed() < backoff(times)) {
+            return FAILED;
+        }
+    }
+    // Before anything is recorded: refused, it is asked again the next time,
+    // and a picture that can't be shown shows what such a picture does.
+    if let Err(error) = crate::rules::guard(&vm.lua, crate::GuardKind::Picture, src) {
+        vm.report(error);
+        return FAILED;
+    }
     let ready = match existing {
-        Some(status) if status.get() != FAILED => return status.get(),
         Some(status) => {
-            let failed = (assets.failed.borrow().get(src)).map(|(at, times, _)| (*at, *times));
-            if failed.is_some_and(|(at, times)| at.elapsed() < backoff(times)) {
-                return FAILED;
-            }
             status.set(LOADING);
             status
         }
@@ -4482,21 +4740,23 @@ fn remote_status_in(
             assets
                 .remote
                 .borrow_mut()
-                .insert(src.to_owned(), ready.clone());
+                .insert(key.clone().into_owned(), ready.clone());
             ready
         }
     };
     let links = assets.links.borrow().clone();
     let fetch = links
         .as_ref()
-        .and_then(|(_, fetcher)| fetcher.borrow().clone());
-    let (Some((timers, _)), Some(fetch)) = (links, fetch) else {
+        .and_then(|(_, fetcher, _)| fetcher.borrow().clone());
+    let (Some((timers, _, policy)), Some(fetch)) = (links, fetch) else {
         vm.report(mlua::Error::runtime(format!(
             "{src}: remote sources need the host's fetcher (`ScriptHost::fetcher`)"
         )));
         return ready.get();
     };
+    // Asked for by a plugin, the request is that plugin's, as its `ui.fetch`.
     let body = crate::calls::Body::kept();
+    body.asked_by(&vm.lua, &policy);
     let future = fetch(
         crate::calls::Request {
             url: src.to_owned(),
@@ -4506,10 +4766,11 @@ fn remote_status_in(
         },
         body.clone(),
     );
-    let (assets, vm, src, runtime) = (
+    let (assets, vm, src, key, runtime) = (
         assets.clone(),
         Rc::downgrade(vm),
         src.to_owned(),
+        key.into_owned(),
         runtime.clone(),
     );
     let arriving = ready.clone();
@@ -4545,11 +4806,11 @@ fn remote_status_in(
         };
         match decoded {
             Ok(Decoded::Image(image)) => {
-                assets.failed.borrow_mut().remove(&src);
+                assets.failed.borrow_mut().remove(&key);
                 assets.keep_image(src, image);
             }
             Ok(Decoded::Svg(svg)) => {
-                assets.failed.borrow_mut().remove(&src);
+                assets.failed.borrow_mut().remove(&key);
                 assets.keep_svg(src, svg);
             }
             Err(error) => {
@@ -4562,7 +4823,7 @@ fn remote_status_in(
                 let times = assets
                     .failed
                     .borrow_mut()
-                    .entry(src)
+                    .entry(key)
                     .and_modify(|(at, times, reason)| {
                         (*at, *times, *reason) = (now, *times + 1, why.clone())
                     })
@@ -4627,7 +4888,12 @@ pub(crate) fn try_load_image_in(
     }
     if is_remote(src) {
         if remote_status_in(vm, assets, runtime, src, false) == FAILED {
-            let why = assets.failed.borrow().get(src).map(|(.., why)| why.clone());
+            let key = remote_key(vm, src);
+            let why = assets
+                .failed
+                .borrow()
+                .get(&*key)
+                .map(|(.., why)| why.clone());
             return Err(format!(
                 "{src} didn't load: {}",
                 why.as_deref().unwrap_or("refused")
@@ -5405,7 +5671,13 @@ fn run(
                 }
                 Action::Host(name, arg) => {
                     let action = actions.borrow().get(&**name).cloned();
+                    let guarded = crate::rules::guard(&vm.lua, crate::GuardKind::Action, name);
                     match action {
+                        _ if guarded.is_err() => {
+                            if let Err(error) = guarded {
+                                vm.report(error);
+                            }
+                        }
                         Some(action) => action(arg.clone()),
                         None => vm.report(mlua::Error::runtime(format!(
                             "no host action named `{name}`"
@@ -6439,7 +6711,7 @@ struct ToldInner {
 }
 impl Told {
     fn new(events: Option<Rc<crate::node::ImageEvents>>, low: &Lowering) -> Self {
-        let timers = (low.assets.links.borrow().as_ref()).map(|(timers, _)| timers.clone());
+        let timers = (low.assets.links.borrow().as_ref()).map(|(timers, ..)| timers.clone());
         Self(Rc::new(ToldInner {
             events,
             timers,
@@ -6745,6 +7017,9 @@ fn list_edges(mut list: View, rare: &crate::node::ListRare, vm: &Rc<Vm>) -> View
     }
     if rare.contain {
         list = list.overscroll_contain();
+    }
+    if rare.ancestor {
+        list = list.virtualize_in_ancestor();
     }
     if let Some(padding) = &rare.scroll_padding {
         list = with_scroll_padding(list, padding, vm);

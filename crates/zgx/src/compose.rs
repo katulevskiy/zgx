@@ -245,6 +245,9 @@ pub(crate) struct ListEdges {
     end: Option<EdgeWatch>,
     start: Option<EdgeWatch>,
     at_end: Option<Box<dyn FnMut(bool)>>,
+    /// `View::virtualize_in_ancestor`: it scrolls with the scroll view
+    /// around it, building the rows that view shows.
+    pub(crate) ancestor: bool,
 }
 impl ListEdges {
     /// Whether its start is watched (`View::on_start`): rows coming in
@@ -300,6 +303,7 @@ pub(crate) fn watch_edges(
         end,
         start,
         mut at_end,
+        ancestor: _,
     } = edges;
     let runtime = ui.runtime.clone();
     let weak = ui.downgrade();
@@ -411,6 +415,8 @@ enum Kind {
         multiline: bool,
     },
     Component(Builder),
+    /// `confined`: a box holding what it mounts, portals included.
+    Confined(Box<View>),
     Provider(Box<dyn FnOnce(&mut Context)>, Box<View>),
     Slot(Slot),
     Region(RegionBuilder),
@@ -427,6 +433,10 @@ struct PortalOptions {
     placement: Option<crate::compose_popover::Placement>,
     /// `layer`: a non-modal layer (toasts).
     layer: bool,
+    /// `top_layer`: a layer above every other, under the document root.
+    top: bool,
+    /// `hoist`: in that layer, over its parent.
+    hoist: Option<Box<crate::compose_modal::Hoist>>,
     /// `View::autofocus`.
     autofocus: Option<bool>,
     modal_placement: Option<crate::compose_modal::ModalPlacement>,
@@ -858,6 +868,17 @@ impl View {
         }
         self
     }
+    /// A virtual list that doesn't scroll itself but with the scroll view
+    /// around it (a panel scrolling as a whole, its sections lists): it is
+    /// as tall as all its rows, and builds only those that view shows (with
+    /// its overscan), again as it scrolls or resizes. Tab, focus, a row
+    /// asked for (`scroll_to_row`, which scrolls the view to it, as near
+    /// as it can) and find in page reach rows not built, as in a list that
+    /// scrolls itself. Not for a list whose rows are measured.
+    pub fn virtualize_in_ancestor(mut self) -> Self {
+        self.edges_mut().ancestor = true;
+        self
+    }
     /// Show an interactive overlay scrollbar on a scroll viewport or virtual list.
     pub fn scrollbar(mut self, visible: bool) -> Self {
         self.rare_mut().scrollbar = Some(visible);
@@ -972,6 +993,19 @@ impl View {
     pub fn layer(mut self) -> Self {
         self.rare_mut().portal.get_or_insert_default().layer = true;
         self
+    }
+    /// The host's layer over everything in the window, whatever a script
+    /// opens: a layer (`layer`: no focus taken, no backdrop) filling the
+    /// window, under the document root, above every other layer and dialog,
+    /// and live under them. The pointer passes through but for the controls
+    /// in it. For what no plugin may cover, in a view a host composes at
+    /// `render`. A script's `z` orders its own element among its siblings,
+    /// and can't reach it.
+    pub fn top_layer(mut self) -> Self {
+        let portal = self.rare_mut().portal.get_or_insert_default();
+        portal.layer = true;
+        portal.top = true;
+        self.w_full().h_full()
     }
     /// Open a menu with its item `id` over the trigger, as a pop-up button's
     /// menu (a select's) opens with the chosen item over the button, rather
@@ -2071,6 +2105,43 @@ impl CanvasLabels {
     }
 }
 
+/// A virtual list's root and region where it scrolls with the scroll view
+/// around it (`View::virtualize_in_ancestor`): as a scroll view's, but as
+/// tall as its rows, clipping nothing. Out of `open_element`'s line: few
+/// lists are.
+#[cold]
+#[inline(never)]
+fn mount_ancestor_list(
+    ui: &mut Ui,
+    parent: NodeId,
+    view: &mut View,
+    rare: Option<&mut Rare>,
+    build: VirtualBuilder,
+    scrollbar: bool,
+    keyboard_navigation: bool,
+) -> (NodeId, RegionBuilder) {
+    let mut defaults = Styles::new();
+    defaults.merge(&view.styles);
+    view.styles = defaults;
+    if keyboard_navigation && view.variants.focus.is_none() {
+        view.variants.defaults[2] = Some(focus_ring(&view.styles));
+    }
+    let (contain, edges) = match rare {
+        Some(rare) => (rare.overscroll_contain, rare.edges.take()),
+        None => (false, None),
+    };
+    let region = virtual_region(build, scrollbar, keyboard_navigation, contain, edges);
+    let size = crate::scene::Style {
+        height: None,
+        intrinsic_height: false,
+        ..scroll_default_size(false)
+    };
+    let root = ui.container(parent, Layout::Overlay, size);
+    ui.semantics
+        .borrow_mut()
+        .set(root, SemanticNode::new(Role::ScrollView, ""));
+    (root, region)
+}
 fn scroll_default_size(horizontal: bool) -> crate::scene::Style {
     crate::scene::Style {
         width: Some(320.),
@@ -2269,6 +2340,74 @@ pub fn scroll_x(offset: Signal<f32>) -> View {
         offset,
         horizontal: true,
     })
+}
+/// `content` in a top layer (`View::top_layer`), drawn and hit over `holder`
+/// and cut to what shows of it, wherever `holder` is in the window, as it
+/// scrolls: `holder` stays in flow, taking the room `content` takes, across
+/// and down, but where `fills` says `holder` has a size of its own, which
+/// `content` then takes. `shown` holds whether at least half of it shows.
+pub fn hoist(
+    runtime: &Runtime,
+    holder: View,
+    content: View,
+    label: impl Into<String>,
+    fills: (bool, bool),
+    shown: Option<Signal<bool>>,
+) -> View {
+    let natural = runtime.signal((0f32, 0f32));
+    let sized = natural.clone();
+    let mut room = div();
+    room.reactive_style = Some(Box::new(move |out: &mut Option<Styles>| {
+        let (width, height) = sized.get();
+        let mut styles = Styles::new();
+        if !fills.0 {
+            styles = styles.w(width);
+        }
+        if !fills.1 {
+            styles = styles.h(height);
+        }
+        *out = Some(styles);
+    }));
+    let mut layer = modal(label, runtime.signal(true)).absolute();
+    let portal = layer.rare_mut().portal.get_or_insert_default();
+    portal.layer = true;
+    portal.top = true;
+    portal.hoist = Some(Box::new(crate::compose_modal::Hoist {
+        fills,
+        natural,
+        shown,
+    }));
+    holder.child(room).child(layer.child(content))
+}
+/// `child` kept to this box, which fills its parent: drawn and hit inside it,
+/// and the portals it opens (a modal, a layer, a popover) mounted in it, so
+/// they are cut to it too, instead of reaching over the window.
+pub fn confined(child: View) -> View {
+    View::new(Kind::Confined(Box::new(child)))
+}
+/// Whether popups opened in a subtree stay in the window for now, under its
+/// top layer, rather than in windows of their own (`Ui::set_popup_screens`),
+/// which nothing in the window can be above. A service: `provide` it around
+/// what may not cover the window's top layer.
+pub struct PopupsInWindow(pub Signal<bool>);
+/// The screens popups opened under `held` may reach: none while it holds.
+#[cold]
+#[inline(never)]
+fn held_screens(
+    ui: &mut Ui,
+    owner: NodeId,
+    held: Rc<PopupsInWindow>,
+) -> Signal<Vec<crate::scene::Rect>> {
+    let all = ui.popup_screens();
+    let screens = ui.signal(Vec::new());
+    let out = screens.clone();
+    ui.bind(owner, move || {
+        out.set(match held.0.get() {
+            true => Vec::new(),
+            false => all.get(),
+        });
+    });
+    screens
 }
 /// A signal-controlled modal portal. Children and fluent styles describe its panel.
 pub fn modal(label: impl Into<String>, open: Signal<bool>) -> View {
@@ -2892,7 +3031,10 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
             *mounted_in.borrow_mut() = Some((ui.runtime.clone(), environment.clone()));
             let size = ui.observe_content_size(root);
             let extent = ui.signal(0.0_f32);
-            if let Some(edges) = edges {
+            // Scrolled with the view around it (`virtualize_in_ancestor`):
+            // that view's wheel, scrollbar and edges are its own.
+            let ancestor = edges.as_ref().is_some_and(|edges| edges.ancestor);
+            if let Some(edges) = edges.filter(|edges| !edges.ancestor) {
                 watch_edges(
                     ui,
                     root,
@@ -2905,7 +3047,10 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
             // Clip rows to the allocated content box, keeping root padding clear.
             let viewport = ui.container(root, Layout::Overlay, Default::default());
             let content = ui.container(viewport, Layout::Overlay, Default::default());
-            ui.scene.borrow_mut().set_scroll_copy(content, true);
+            if !ancestor {
+                ui.scene.borrow_mut().set_scroll_copy(content, true);
+            }
+            let window = ancestor.then(|| AncestorWindow::new(ui, root, viewport));
             let stretch = ListStretch::new(
                 ui,
                 root,
@@ -2934,6 +3079,10 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                 // Focus moving to a row's control: scrolled to it.
                 // A list with keyboard navigation places its focused row
                 // itself (`Navigation`).
+                // Scrolled with the view around it: that view's, both.
+                if ancestor {
+                    return;
+                }
                 if matches!(cx.event, InputEvent::Focus)
                     && cx.target != root
                     && !keyboard_navigation
@@ -2966,7 +3115,7 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                     }
                 }
             });
-            if scrollbar {
+            if scrollbar && !ancestor {
                 crate::compose_scrollbar::mount(
                     ui,
                     root,
@@ -2996,7 +3145,7 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
             let mut handled_reveal = 0;
             ui.bind(root, move || {
                 let length = count();
-                let (width, height) = size.get();
+                let (width, mut height) = size.get();
                 let model = crate::virtual_list::VirtualList::new(length, row_height, overscan);
                 let requested = offset.get();
                 // As a scroll view takes it: past the end (`math.huge`) is
@@ -3007,6 +3156,12 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                 } else {
                     requested.clamp(0.0, limit)
                 };
+                // The part the view around it shows.
+                if let Some(window) = &window
+                    && let Some(shown) = window.shown(&weak, model.content_height())
+                {
+                    (position, height) = shown;
+                }
                 let request = navigation
                     .as_ref()
                     .map(|navigation| navigation.request.get());
@@ -3022,10 +3177,15 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                 handled_reveal = serial;
                 if let Some((index, align)) = asked.or(target.map(|i| (i, RowAlign::Nearest))) {
                     let top = model.row_offset(index);
-                    position = align
-                        .position(top, row_height, height, position)
-                        .max(0.)
-                        .min((model.content_height() - height).max(0.));
+                    if let Some(window) = &window {
+                        // The view around it scrolls to it; built as it shows.
+                        window.reveal_from(&weak, top, row_height);
+                    } else {
+                        position = align
+                            .position(top, row_height, height, position)
+                            .max(0.)
+                            .min((model.content_height() - height).max(0.));
+                    }
                 }
                 let range = model.visible_range(position, height);
                 keys.clear();
@@ -3109,18 +3269,23 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                     }
                     {
                         let mut scene = ui.scene.borrow_mut();
+                        // Scrolled with the view around it: as tall as its
+                        // rows, unclipped, in place.
                         scene.set_style(
                             viewport,
-                            crate::scene::Style {
-                                clip: true,
-                                ..crate::widgets::fixed(width, height)
+                            match ancestor {
+                                true => crate::widgets::fixed(width, model.content_height()),
+                                false => crate::scene::Style {
+                                    clip: true,
+                                    ..crate::widgets::fixed(width, height)
+                                },
                             },
                         );
                         scene.set_style(
                             content,
                             crate::widgets::fixed(width, model.content_height()),
                         );
-                        stretch.place(&mut scene, position);
+                        stretch.place(&mut scene, if ancestor { 0. } else { position });
                         order.clear();
                         for (key, index) in &keys {
                             let (node, _, placed) = entries.get_mut(key).expect("a row");
@@ -3151,7 +3316,7 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                     transaction.commit();
                     extent.set(model.content_height());
                     let unchanged_request = offset.get().to_bits() == requested.to_bits();
-                    if unchanged_request {
+                    if unchanged_request && !ancestor {
                         offset.set(position);
                     }
                     if let Some(navigation) = &navigation {
@@ -3241,6 +3406,29 @@ impl Drop for IdRegistration {
         }
     }
 }
+/// `compose::confined`: a box clipping what it holds, portals included.
+#[cold]
+#[inline(never)]
+fn mount_confined(
+    ui: &mut Ui,
+    parent: NodeId,
+    child: View,
+    mut environment: Environment,
+) -> NodeId {
+    let node = ui.container(
+        parent,
+        Layout::Overlay,
+        crate::scene::Style {
+            clip: true,
+            width_percent: Some(100.),
+            height_percent: Some(100.),
+            ..Default::default()
+        },
+    );
+    environment.portal = Some((node, ui.signal(true)));
+    mount(ui, node, child, environment);
+    node
+}
 pub(crate) fn mount(
     ui: &mut Ui,
     parent: NodeId,
@@ -3260,6 +3448,7 @@ pub(crate) fn mount(
     ui.set_mount_depth(depth + 1);
     let root = match kind {
         Kind::Component(build) => mount_component(ui, parent, build, view, environment),
+        Kind::Confined(child) => mount_confined(ui, parent, *child, environment),
         Kind::Provider(provide, child) => {
             mount_provider(ui, parent, provide, *child, view, environment)
         }
@@ -3548,15 +3737,47 @@ fn mount_portal_panel(
             *out = Some(styles.unwrap_or_else(Styles::new).min_w(bounds.get().width));
         }));
     }
+    let top = (view.rare.as_ref())
+        .and_then(|r| r.portal.as_ref())
+        .is_some_and(|p| p.top);
     let portal_parent = environment
         .portal
         .as_ref()
+        .filter(|_| !top)
         .map_or(ui.root(), |(node, _)| *node);
     let parent_visible = environment
         .portal
         .as_ref()
+        .filter(|_| !top)
         .map(|(_, visible)| visible.clone());
     let portal = crate::compose_modal::create(ui, owner, portal_parent);
+    let screens = match environment.services.get::<PopupsInWindow>() {
+        Some(held) if anchored => held_screens(ui, owner, held),
+        _ => ui.popup_screens(),
+    };
+    let hoist = (view.rare.as_mut())
+        .and_then(|r| r.portal.as_mut())
+        .and_then(|p| p.hoist.take());
+    if let Some(at) = &hoist
+        && let Some(over) = ui.scene.borrow().parent(owner)
+    {
+        let bounds = ui.observe_bounds(over);
+        let fills = at.fills;
+        view.reactive_style = Some(Box::new(move |out: &mut Option<Styles>| {
+            let bounds = bounds.get();
+            let mut styles = Styles::new();
+            if fills.0 {
+                styles = styles.w(bounds.width);
+            }
+            if fills.1 {
+                styles = styles.h(bounds.height);
+            }
+            *out = Some(styles);
+        }));
+    }
+    if top {
+        ui.scene.borrow_mut().set_z(portal.overlay, i32::MAX);
+    }
     // A layer (`View::layer`, a toast host) or a panel at a caret is no
     // modal: it has no backdrop, and closes nothing as it opens.
     let overlay_only = (view.rare.as_ref())
@@ -3647,7 +3868,7 @@ fn mount_portal_panel(
     let viewport = ui.observe_bounds(ui.root());
     // Anchored, it may reach past the window, to the screen's edges, and be
     // cut to the room there by the platform (`Ui::set_popup_limit`).
-    let area = anchor.map(|anchor| (ui.popup_screens(), ui.observe_bounds(anchor)));
+    let area = anchor.map(|anchor| (screens.clone(), ui.observe_bounds(anchor)));
     let limit = anchor.map(|_| (ui.popup_limits(), portal.position));
     let mut dynamic = view.reactive_style.take();
     view.reactive_style = Some(Box::new(move |out: &mut Option<Styles>| {
@@ -3663,7 +3884,11 @@ fn mount_portal_panel(
                 screens.with(|screens| crate::compose_popover::screen_of(screens, anchor))
             })
             .unwrap_or_else(|| viewport.get());
-        let margin = if anchored { 8. } else { 32. };
+        let margin = match (top, anchored) {
+            (true, _) => 0.,
+            (_, true) => 8.,
+            _ => 32.,
+        };
         if !has_max_width && styles.rare().max_width.is_none() {
             styles.rare_mut().max_width = Some((bounds.width - margin).max(0.));
         }
@@ -3770,6 +3995,7 @@ fn mount_portal_panel(
     if let Some(anchor) = anchor {
         if is_submenu {
             crate::compose_popover::mount_submenu(
+                screens.clone(),
                 ui,
                 owner,
                 anchor,
@@ -3854,6 +4080,7 @@ fn mount_portal_panel(
                 false => anchor,
             };
             crate::compose_popover::mount(
+                screens.clone(),
                 ui,
                 owner,
                 placed_at,
@@ -3868,6 +4095,10 @@ fn mount_portal_panel(
     } else {
         match modal_placement {
             Some(at) => crate::compose_modal::place(ui, owner, portal.position, at),
+            None if top => match hoist {
+                Some(at) => crate::compose_modal::hoist(ui, owner, &portal, panel, *at),
+                None => crate::compose_modal::fill(ui, owner, &portal, panel),
+            },
             None => crate::compose_modal::center(ui, owner, portal.position),
         }
     }
@@ -3949,8 +4180,7 @@ fn mount_portal_panel(
     // a window of its own (`Scene::set_popup`). Closed, it is none, so a
     // list's hundred row menus cost the host nothing.
     if anchored {
-        let (screens, visible, position) =
-            (ui.popup_screens(), portal.visible.clone(), portal.position);
+        let (screens, visible, position) = (screens, portal.visible.clone(), portal.position);
         let weak = ui.downgrade();
         ui.bind(owner, move || {
             let popup = visible.get() && screens.with(|screens| !screens.is_empty());
@@ -4914,26 +5144,44 @@ fn open_element(
                 view.children.is_empty(),
                 "virtual lists build children through their row factory"
             );
-            // As a scroll view: 320 by 240 unless something sizes it (a
-            // parent stretching it across, `grow`, its own `w`/`h`).
-            let mut defaults = Styles::new().overflow_hidden();
-            defaults.merge(&view.styles);
-            view.styles = defaults;
-            if keyboard_navigation && view.variants.focus.is_none() {
-                view.variants.defaults[2] = Some(focus_ring(&view.styles));
+            if rare
+                .as_deref()
+                .and_then(|r| r.edges.as_deref())
+                .is_some_and(|edges| edges.ancestor)
+            {
+                let (root, built) = mount_ancestor_list(
+                    ui,
+                    parent,
+                    &mut view,
+                    rare.as_deref_mut(),
+                    build,
+                    scrollbar,
+                    keyboard_navigation,
+                );
+                region = Some(built);
+                root
+            } else {
+                // As a scroll view: 320 by 240 unless something sizes it (a
+                // parent stretching it across, `grow`, its own `w`/`h`).
+                let mut defaults = Styles::new().overflow_hidden();
+                defaults.merge(&view.styles);
+                view.styles = defaults;
+                if keyboard_navigation && view.variants.focus.is_none() {
+                    view.variants.defaults[2] = Some(focus_ring(&view.styles));
+                }
+                region = Some(virtual_region(
+                    build,
+                    scrollbar,
+                    keyboard_navigation,
+                    rare.as_deref().is_some_and(|r| r.overscroll_contain),
+                    rare.as_deref_mut().and_then(|r| r.edges.take()),
+                ));
+                let root = ui.container(parent, Layout::Overlay, scroll_default_size(false));
+                ui.semantics
+                    .borrow_mut()
+                    .set(root, SemanticNode::new(Role::ScrollView, ""));
+                root
             }
-            region = Some(virtual_region(
-                build,
-                scrollbar,
-                keyboard_navigation,
-                rare.as_deref().is_some_and(|r| r.overscroll_contain),
-                rare.as_deref_mut().and_then(|r| r.edges.take()),
-            ));
-            let root = ui.container(parent, Layout::Overlay, scroll_default_size(false));
-            ui.semantics
-                .borrow_mut()
-                .set(root, SemanticNode::new(Role::ScrollView, ""));
-            root
         }
         Kind::Region(build) => {
             region = Some(build);
@@ -5845,6 +6093,110 @@ pub(crate) fn focus_movement(
     } else {
         0.
     })
+}
+/// Where a list that scrolls with the scroll view around it
+/// (`View::virtualize_in_ancestor`) shows: its viewport's place, and those
+/// of the scroll views around it, the window and the boxes between it and
+/// the innermost view, followed (each moves as a view scrolls, or a box
+/// resizes).
+pub(crate) struct AncestorWindow {
+    viewport: NodeId,
+    list: Signal<crate::scene::Rect>,
+    /// The innermost scroll view around it (else the window) first, then
+    /// the others, the window and the boxes between it and that view.
+    around: Vec<Signal<crate::scene::Rect>>,
+}
+impl AncestorWindow {
+    pub(crate) fn new(ui: &Ui, root: NodeId, viewport: NodeId) -> Self {
+        let (mut views, clips): (Vec<NodeId>, Vec<NodeId>) = {
+            let scene = ui.scene.borrow();
+            let views = scene
+                .ancestors(root)
+                .filter(|id| scene.is_scroll_content(*id))
+                .filter_map(|content| scene.parent(content))
+                .collect();
+            // And every box between it and the innermost of them, any of
+            // which may clip it (its style, set as it mounts, perhaps not
+            // yet), showing more or less of it as it grows or shrinks (one
+            // easing open) without moving it.
+            let clips = scene
+                .ancestors(root)
+                .take_while(|id| !scene.is_scroll_content(*id))
+                .collect();
+            (views, clips)
+        };
+        views.push(ui.root());
+        views.extend(clips);
+        Self {
+            viewport,
+            list: ui.observe_bounds(viewport),
+            around: views
+                .into_iter()
+                .map(|view| ui.observe_bounds(view))
+                .collect(),
+        }
+    }
+    /// The part of the list's `total` points shown: its top, in the list's
+    /// points, and its height (0 where none shows: the top, or the end if
+    /// the view has scrolled past it). Tracked: it runs again as either
+    /// moves.
+    pub(crate) fn window(&self, ui: &Ui, total: f32) -> (f32, f32) {
+        self.list.get();
+        let around = self
+            .around
+            .iter()
+            .map(Signal::get)
+            .next()
+            .unwrap_or_default();
+        for view in self.around.iter().skip(1) {
+            let _ = view.get();
+        }
+        let scene = ui.scene.borrow();
+        if !scene.contains(self.viewport) {
+            return (0., 0.);
+        }
+        let list = scene.world_bounds(self.viewport);
+        match scene.visible_bounds(self.viewport) {
+            Some(shown) if shown.height > 0. => {
+                let top = (shown.y - list.y).clamp(0., total);
+                (top, shown.height.min(total - top))
+            }
+            // Past it: below the view, its start; above, its end.
+            _ => (if list.y > around.y { 0. } else { total }, 0.),
+        }
+    }
+    /// `window`, for a list's rows binding: out of its line, the `Ui`
+    /// upgraded here.
+    #[inline(never)]
+    pub(crate) fn shown(&self, ui: &crate::widgets::WeakUi, total: f32) -> Option<(f32, f32)> {
+        Some(self.window(&ui.upgrade()?, total))
+    }
+    /// `reveal`, for a list's rows binding: out of its line.
+    #[inline(never)]
+    pub(crate) fn reveal_from(&self, ui: &crate::widgets::WeakUi, top: f32, height: f32) {
+        if let Some(ui) = ui.upgrade() {
+            self.reveal(&ui, top, height);
+        }
+    }
+    /// Scroll the views around it so its points `top` to `top + height`
+    /// show, as near as they can, once this layout is done.
+    pub(crate) fn reveal(&self, ui: &Ui, top: f32, height: f32) {
+        let (weak, viewport) = (ui.downgrade(), self.viewport);
+        ui.after_layout(Box::new(move || {
+            let Some(mut ui) = weak.upgrade() else {
+                return;
+            };
+            let rect = {
+                let scene = ui.scene.borrow();
+                if !scene.contains(viewport) {
+                    return;
+                }
+                let list = scene.world_bounds(viewport);
+                crate::scene::Rect::new(list.x, list.y + top, list.width, height)
+            };
+            ui.scroll_rect_into_view_in_layout(viewport, rect);
+        }));
+    }
 }
 /// A list's `Focus` handler: its offset moved so focused `target` (a
 /// control in a row) shows in `viewport`, its extent and size bounding it.
@@ -7100,6 +7452,15 @@ impl NodeHandle {
     /// The mounted node.
     pub fn node(&self) -> NodeId {
         self.node
+    }
+    /// Where the node shows in the window, in points, through whatever
+    /// transforms and zooms it lies under; `None` once it or its UI is gone.
+    pub fn window_bounds(&self) -> Option<crate::scene::Rect> {
+        let ui = self.ui.upgrade()?;
+        let scene = ui.scene.borrow();
+        scene
+            .contains(self.node)
+            .then(|| scene.window_rect(self.node, scene.bounds(self.node)))
     }
     /// The `Ui` it is mounted in.
     pub(crate) fn ui_handle(&self) -> &WeakUi {

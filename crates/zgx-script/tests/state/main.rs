@@ -11,6 +11,8 @@ mod async_handlers;
 mod calls;
 #[path = "../form_values.rs"]
 mod form_values;
+#[path = "../guard_doors.rs"]
+mod guard_doors;
 #[path = "../io.rs"]
 mod io;
 #[path = "../large_data.rs"]
@@ -25,6 +27,8 @@ mod ownership;
 mod packages;
 #[path = "../paged.rs"]
 mod paged;
+#[path = "../plugin_bounds_forget.rs"]
+mod plugin_bounds_forget;
 #[path = "../plugin_branches.rs"]
 mod plugin_branches;
 #[path = "../plugin_context.rs"]
@@ -41,6 +45,8 @@ mod plugin_packages;
 mod plugin_report;
 #[path = "../plugin_rows.rs"]
 mod plugin_rows;
+#[path = "../plugin_rules.rs"]
+mod plugin_rules;
 #[path = "../plugin_shared.rs"]
 mod plugin_shared;
 #[path = "../plugin_targets.rs"]

@@ -92,6 +92,7 @@ Further native Linux probes, each on a private Xvfb/Openbox desktop or a nested 
 - The double-click time follows the desktop's (GNOME's `double-click` from a stand-in portal): at 1000 ms two presses 700 ms apart select a word, at 300 ms two 450 ms apart do not (`double_click_time_smoke.py`).
 - The drag threshold follows the desktop's (GNOME's `drag-threshold` from a stand-in portal): at 24 a press on drag_drop's card moved 12 pixels is no drag and one moved 40 is; with no setting GTK's 8 holds, 6 pixels no drag and 12 one (`drag_threshold_smoke.py`).
 - A title bar's double click follows GNOME's `action-double-click-titlebar` (from a stand-in portal, changed live): glass_counter's drag strip minimizes its window under "minimize", does nothing under "none" and maximizes it under "toggle-maximize" (`titlebar_double_click_smoke.py`).
+- A window's glass asks the compositor to blur behind it (`linux_glass_blur_smoke.py`, glass_counter with `WAYLAND_DEBUG=1` under a headless sway): the window is configured and drawn with no protocol error; where the compositor advertises `ext_background_effect_manager_v1` its surface asks for a background effect and a blur region, where only KWin's blur is advertised it asks KWin's, and where neither is (sway 1.9 here) nothing is asked; on X11 the window runs. A compositor with the protocol (Hyprland 0.57) was checked by hand: `get_background_effect` and `set_blur_region` sent, no error.
 - Middle-click paste follows GNOME's `gtk-enable-primary-paste` (from a stand-in portal): off, a middle click in primary_selection's empty editor pastes nothing though another client owns the primary selection; on, it pastes that (`primary_paste_setting_smoke.py`).
 - Overlay scrollbars follow GNOME's `overlay-scrolling` (from a stand-in portal): on, the scrollbars example's vertical scrollbar is hidden at rest, shows as its view is scrolled with the wheel and hides again 2.5 s after; off, it shows at rest (`overlay_scrolling_smoke.py`).
 - XSETTINGS on X11 come ahead of the portal, as GTK takes them there: xsettingsd's `Net/DndDragThreshold` 30 and `Net/DoubleClickTime` 1000 hold over a stand-in portal's GNOME 8 and 300 (XFCE with the GTK portal installed): 20 pixels is no drag and 40 one, two presses 700 ms apart a double click; changed to 10 and reloaded, 20 pixels drags once the window is activated again. With the portal's `color-scheme` no preference, `Net/ThemeName` "Greybird" makes the primary_selection example light, and changed to "Greybird-dark", dark once its window is activated again (`xsettings_smoke.py`).
@@ -112,7 +113,9 @@ Further native Linux probes, each on a private Xvfb/Openbox desktop or a nested 
 - No fonts at all: the gallery on Xvfb, its fontconfig listing only an empty directory, draws its window (every control, no text), says once on stderr why its text does not show, and does not panic (`no_fonts_smoke.py`).
 - X screens of 16 and 30 bits: the gallery on Xvfb at each depth shows a window of a 32-bit visual, drawing exactly the pixels it draws on a 24-bit screen, with no panic (`x11_depths_smoke.py`).
 - GL where no Vulkan driver is: the gallery on Xvfb with no Vulkan driver to find starts and draws the same pixels as through lavapipe, with Mesa's GL loaded; with Vulkan, no GL driver is mapped (`gl_fallback_smoke.py`).
-- Popups past the window on Wayland: under sway, popup_probe's menu clicked open with a virtual pointer shows as an `xdg_popup` past the window's bottom edge, exactly where the scene placed it, drawn; its last item, below the window, clicked, is chosen and the popup goes; opened again, a press in the window closes it; the window moved near the output's bottom, the menu flips above its trigger, 4 points off it, and its first item takes a click there. The submenus example's submenu, a popup of its menu, opens beside that menu where the compositor flipped it (48 points down it, at its right edge). A menu of 60 items, taller than the 960-point output, is cut to it by the compositor, laid out 960 high, and scrolled to its last item, which takes a click. A popover with an arrow, flipped above its trigger by the compositor near the output's bottom, is placed there by the scene, its arrow's tip on its bottom edge, centred on the trigger. On outputs scaled 2× and 1.5× (fractional, through the viewporter), the menu's buffer is its size in the output's pixels (400 × 404, 300 × 303), it shows where the scene put it in those pixels, within one, and its last item takes a click. Under Weston, the menu opened by the app sits the same on the content, below the title bar winit draws (`wayland_popups_smoke.py`).
+- Decision controls on X11 (`decision_probe_smoke.py`, the `decision_probe` example): a plugin's overflowing popover shows in a window of its own, then none once a `ui.decision` is up, counted by the X server, and with a plugin's modal and its nested popover up; the app's own popup keeps its window. Real pointer clicks at the control's button reach it through all of that. On macOS the same example counts the system's windows itself; on Windows this is by reading the code (the hold is in compose, and every backend draws `Scene::popups`), not run.
+- Sealed regions on X11 (the same smoke, `--sealed`): a plugin's modal over a `ui.sealed` page, and one it opens in its own page, which stays in that page's box; real pointer clicks reach the region's own buttons through each, and no popup shows in a window of its own.
+- Popups past the window on Wayland: under sway, popup_probe's menu clicked open with a virtual pointer shows as an `xdg_popup` past the window's bottom edge, exactly where the scene placed it, drawn; its last item, below the window, clicked, is chosen and the popup goes; opened again, a press in the window closes it; the window moved near the output's bottom, the menu flips above its trigger, 4 points off it, and its first item takes a click there. The submenus example's submenu, a popup of its menu, opens beside that menu where the compositor flipped it (48 points down it, at its right edge). A menu of 60 items, taller than the 960-point output, is cut to it by the compositor, laid out 960 high, and scrolled to its last item, which takes a click. A popover with an arrow, flipped above its trigger by the compositor near the output's bottom, is placed there by the scene, its arrow's tip on its bottom edge, centred on the trigger. Under Weston (whose `xdg_wm_base` is v5; sway 1.9's v2 has no reposition, so there it shows anew), a popover grown and shrunk a step a frame (`POPUP_PROBE_GROW`, as an animated one is) stays one popup the whole time, moved and resized in place (`xdg_popup.reposition`, at least 60 times), never shown anew. On outputs scaled 2× and 1.5× (fractional, through the viewporter), the menu's buffer is its size in the output's pixels (400 × 404, 300 × 303), it shows where the scene put it in those pixels, within one, and its last item takes a click. Under Weston, the menu opened by the app sits the same on the content, below the title bar winit draws (`wayland_popups_smoke.py`).
 - Drags out to other apps on Wayland: under sway, drag_probe's chip dragged with a virtual pointer onto a GTK window of the probe's own (`GDK_BACKEND=wayland`) is taken as `UTF8_STRING`, under its icon, and the source hears it accepted; back over its own window, or over a GTK target that refuses it and hears it move, nothing is dropped and the source hears it not taken; a text field's selected words, pressed on and dragged out onto the GTK target, arrive there as text; drag_probe's tab, carrying nothing to other apps, drops on the Other window's strip (accepted) and, let go on the bare desktop, is torn off; a window's only tab moves its window with the pointer, by the compositor's move (`wayland_drag_out_smoke.py`).
 - Text dragged in from other apps on Wayland: under sway, the same GTK source (`GDK_BACKEND=wayland`) dragged with a virtual pointer onto drag_probe's Words field drops its text at the field's end, hovering changing nothing, and the source hears it taken; let go over the chip it is refused (`wayland_text_drop_smoke.py`).
 - A window manager's resize waits for zgx's frames on X11: window_probe's window names `_NET_WM_SYNC_REQUEST` and its counter, and through an Openbox Alt and right button resize of 12 steps the counter goes from 0 to Openbox's last request, the window takes the pointer's size and a frame is drawn for each step (`resize_sync_smoke.py`).
@@ -1151,6 +1154,22 @@ focused, though the page takes ⌘K and Ghostty binds it, and the page never
 hears them, while ⌘U, not reserved, is still the page's first and then the
 app's. Passed on macOS 26 (M5), 2026-10-28.
 
+## macOS Ghostty colours following the theme
+
+The ghostty_theme_probe example (`--features ghostty`) runs a program that
+prints a row of full blocks in the default colour and one in ANSI red, once,
+then sleeps. Three times over, it switches to a theme setting
+`terminal.foreground` and `terminal.ansi.1`, scopes `terminal.foreground`
+alone over the terminal, takes the scope away, and goes back to zgx's dark
+theme, which sets no terminal colours. Each time it reads Ghostty's own last
+frame (`Terminal::snapshot`). The printed blocks repaint in each step's
+colours: the scope's text colour with the theme's red, and the user's own
+Ghostty colours again at the end, as at first. The surface is the same
+throughout (its backend kept). Ghostty draws in Display P3, so a colour
+matches as given or converted to P3. It prints `GHOSTTY_THEME_DONE ok=true`,
+or exits 1. Passed three times out of three on macOS 26.0.1 (M1 Max),
+2026-11-03.
+
 ## macOS glass and appearance set while a window shows
 
 `glass_counter --appearance-fixture` replaces the window's glass with
@@ -1252,6 +1271,13 @@ hold (53 MB, M5 Max, macOS 26.4, 2026-10-30). `ZGX_PROBE_DIFFERENT=1` skips
 that last check on a Mac without the hold. `crates/zgx-gpu/tests/baked_loops.rs`
 covers what stays in the frames and what draws a sheet again, and
 `crates/zgx-script/tests/anime.rs` (`baked`) what hands a loop back to the engine.
+
+`scripts/macos_zoomed_loops_probe.py` zooms that window (100%, 110%, 90%): a
+loop's layer lies in a row with a still box the frames draw, its top, height
+and edge theirs, read from captures. `crates/zgx-gpu/tests/zoomed_layers.rs`
+covers the frames of loops' and GPU views' layers, the caret as read back, and
+what the frames draw themselves (moved, faded, turned, shaders', layers')
+under partial repaints, at each of those zooms.
 
 ## macOS caret (Core Animation's)
 

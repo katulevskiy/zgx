@@ -39,6 +39,7 @@ mod design;
 pub mod driver;
 mod element;
 mod elements_report;
+mod fetch_policy;
 pub use elements_report::{ElementGroup, ElementsReport, ListedElement};
 mod errors;
 #[cfg(target_os = "macos")]
@@ -76,6 +77,7 @@ mod reloads;
 mod reorder;
 mod router;
 mod routes;
+mod rules;
 pub mod scaffold;
 #[cfg(feature = "scene3d")]
 mod scene3d;
@@ -97,6 +99,7 @@ pub use bundle::{Bundle, BundleFile, build};
 pub use calls::{Body, Request, Response};
 pub use command::{Command, DroppedShortcut};
 pub use design::DesignLint;
+pub use fetch_policy::{FetchPolicy, Url};
 pub use persist::app_data_dir;
 pub use socket::{Message, Socket, SocketRequest};
 pub use windows::WindowState;
@@ -104,6 +107,7 @@ pub use windows::WindowState;
 pub fn window_size_value(width: f32, height: f32) -> Value {
     windows::size(width, height)
 }
+pub use rules::GuardKind;
 pub use value::{ElementHandle, PathKey, Shared, Store, Value, tables_converted, values_converted};
 pub use windows::{Window, WindowExtras};
 
@@ -914,17 +918,25 @@ pub enum Capability {
     /// ones (never `@app/…`), and lends no authority: what it calls is gated
     /// by the plugin's grants, as the plugin's own code is.
     Package(String),
-    /// Replacing an element of the app's (`ui.contribute { target,
-    /// replace }`), or one of its `@app/…` modules (`ui.override`): the
-    /// target or module as the plugin writes it, or `"*"` for any. Adding
-    /// before or after an element is open, as a slot is, unless the host
-    /// asks a capability for that target (`expose_hook`).
+    /// The older spelling of [`OverrideElement`](Self::OverrideElement) and
+    /// [`OverrideModule`](Self::OverrideModule), read by what it names: a
+    /// target or `"*"` is `OverrideElement`, a module (`"@app/…"`) is
+    /// `OverrideModule` of that module. `"*"` no longer reaches modules.
+    Override(String),
+    /// Replacing or filtering an element of the app's (`ui.contribute {
+    /// target, replace }`, `ui.filter`): the target as the plugin writes it,
+    /// or `"*"` for any. Adding before or after an element is open, as a
+    /// slot is, unless the host asks a capability for that target
+    /// (`expose_hook`).
+    OverrideElement(String),
+    /// Replacing one of the app's modules (`ui.override`): `"@app/…"` as the
+    /// plugin writes it, or `"*"` for any.
     ///
     /// **A trust grant, not a permission over the interface:** a module
     /// replacement runs in the app's VM as the app's own code, with all its
-    /// access. `Override("@app/…")` trusts the plugin with that module;
-    /// `Override("*")` trusts it with the app.
-    Override(String),
+    /// access. `OverrideModule("@app/…")` trusts the plugin with that module;
+    /// `OverrideModule("*")` trusts it with the app.
+    OverrideModule(String),
 }
 
 /// A plugin an app loads (`ScriptHost::set_plugins`): its name (what errors
@@ -1485,6 +1497,8 @@ struct Inner {
     fetcher: calls::SharedFetcher,
     /// The transport `ui.socket` connects through (`socket_connector`).
     connector: socket::SharedConnector,
+    /// What the app allows of scripts' requests (`fetch_policy`).
+    fetch_policy: fetch_policy::SharedPolicy,
     /// What each plugin may do beyond its sandbox (`grant`), by name.
     grants: RefCell<HashMap<String, Vec<Capability>>>,
     /// What every plugin may do (`grant_all_plugins`), those loaded later
@@ -1532,6 +1546,9 @@ struct Inner {
     /// (`window_chrome`).
     chrome: RefCell<Option<zgx::reactive::Effect>>,
     window_size: RefCell<Option<zgx::reactive::Effect>>,
+    /// `ui.window.full_screen` and `full_screen_transition` kept as the
+    /// window says (`ScriptHost::window_full_screen`).
+    full_screen: RefCell<Option<zgx::reactive::Effect>>,
     /// Keeps the window's zoom and `ui.window.zoom` the same (`window_zoom`).
     zoom: RefCell<Option<zgx::reactive::Effect>>,
     visible: RefCell<Option<zgx::reactive::Effect>>,
@@ -1567,6 +1584,7 @@ struct Inner {
     /// (`components/card` for `@app/components/card`): gathered as the
     /// plugins load, before the app, and read by the app's `require`.
     overrides: RefCell<HashMap<String, node::ModuleOverride>>,
+    decisions: Rc<lower::Decisions>,
     /// Terminal sessions (`ui.term`): they outlive reloads.
     terms: Rc<term::Terms>,
     /// Web pages by id (`ui.web(id)`): they outlive reloads too.
@@ -1684,6 +1702,7 @@ impl ScriptHost {
             async_actions: Rc::default(),
             fetcher: Rc::default(),
             connector: Rc::default(),
+            fetch_policy: Rc::default(),
             grants: RefCell::default(),
             all_plugins: RefCell::default(),
             managed: RefCell::default(),
@@ -1732,6 +1751,7 @@ impl ScriptHost {
             shared: Rc::new(Store::new(runtime)),
             chrome: RefCell::default(),
             window_size: RefCell::default(),
+            full_screen: RefCell::default(),
             zoom: RefCell::default(),
             visible: RefCell::default(),
             window_state: RefCell::default(),
@@ -1747,6 +1767,7 @@ impl ScriptHost {
             lent_compiles: Cell::new(0),
             sources: sources::Sources::default(),
             overrides: RefCell::default(),
+            decisions: Rc::new(lower::Decisions::new(runtime)),
             terms: Rc::default(),
             webs: Rc::default(),
             commands: Rc::new(command::Commands::new(runtime)),
@@ -1769,9 +1790,11 @@ impl ScriptHost {
             theme_error: RefCell::default(),
             idle: RefCell::default(),
         }));
-        host.0
-            .assets
-            .connect(host.0.timers.clone(), host.0.fetcher.clone());
+        host.0.assets.connect(
+            host.0.timers.clone(),
+            host.0.fetcher.clone(),
+            host.0.fetch_policy.clone(),
+        );
         host.trim_when_idle();
         host
     }
@@ -1883,6 +1906,50 @@ impl ScriptHost {
     pub(crate) fn expose_classes(&self) {
         element::Classes::register(&self.0.runtime, &self.0.elements);
     }
+    /// Where what `plugin` adds shows in the window now, in points, through
+    /// whatever transforms and zooms it lies under: a box for each mounted
+    /// `ui.contribute` into a slot or before, after or in place of an
+    /// element. What a `ui.filter` changes stays the app's own element, and
+    /// a box with no area is left out. For a host to say what is whose (a
+    /// click on a plugin's control, a preview outlining it).
+    pub fn contribution_bounds(&self, plugin: &str) -> Vec<zgx::scene::Rect> {
+        let current = self.0.current.borrow();
+        let Some(loaded) = current.as_ref() else {
+            return Vec::new();
+        };
+        let lowering = &loaded.lowering;
+        let added = lowering
+            .hooks
+            .as_deref()
+            .map(|hooks| hooks.all())
+            .unwrap_or_default()
+            .iter()
+            .filter(|hook| &*hook.owner == plugin && matches!(hook.adds, node::Adds::Node(..)))
+            .map(|hook| &hook.stats);
+        let slotted = lowering
+            .slots
+            .values()
+            .flatten()
+            .filter(|(owner, _, _)| &**owner == plugin)
+            .map(|(_, _, stats)| stats);
+        added
+            .chain(slotted)
+            .flat_map(|stats| stats.mounted.borrow().clone())
+            .filter_map(|handle| handle.window_bounds())
+            .filter(|bounds| bounds.width > 0. && bounds.height > 0.)
+            .collect()
+    }
+    /// Forgets a script's state: its `ui.state` and `ui.persist` values held
+    /// here, what waits to be saved, and its saved files, gone by the time
+    /// this returns. `script` names it as state is kept: `"plugin:<name>"`
+    /// for a plugin of [`set_plugins`](Self::set_plugins). For uninstalling
+    /// a plugin: call it once the plugin is no longer loaded (a VM still
+    /// running keeps what it holds until it goes); the next load that asks
+    /// starts from its `initial`.
+    pub fn forget_state(&self, script: &str) {
+        self.0.stores.borrow_mut().remove(script);
+        self.0.persist.forget(script);
+    }
     /// What each plugin adds at the app's elements (`ui.contribute { target
     /// }`, `ui.filter`), in the order they made them: its target, where it
     /// goes, how many elements it applies at now, and its latest error. A
@@ -1968,10 +2035,14 @@ impl ScriptHost {
         *self.0.error_watch.borrow_mut() = Some(Box::new(watch));
     }
     fn configure(self, f: impl FnOnce(&mut Inner)) -> Self {
+        let rules = rules::of(&self.0);
         let mut inner = Rc::try_unwrap(self.0)
             .unwrap_or_else(|_| panic!("configure a ScriptHost before cloning it"));
         f(&mut inner);
         let host = Self(Rc::new(inner));
+        if let Some(rules) = rules {
+            rules::attach(&host.0, rules);
+        }
         // The host is a new `Rc`: what goes idle with it follows it.
         host.trim_when_idle();
         host
@@ -2193,6 +2264,16 @@ impl ScriptHost {
             Box::pin(connect(request, socket))
         }));
     }
+    /// What the app allows of its scripts' requests, `ui.fetch`, remote
+    /// images and `ui.socket`, each attributed to the plugin that made it:
+    /// every URL including each redirect's, every address a host resolves
+    /// to, and every header a script sets. Without one, all are allowed.
+    /// `zgx-run`'s transports call it; a host's own transport reads it, and
+    /// the caller, from `Body` or `Socket`. It replaces the last, for the
+    /// requests made from now on.
+    pub fn fetch_policy(&self, policy: impl FetchPolicy) {
+        *self.0.fetch_policy.borrow_mut() = Some(std::sync::Arc::new(policy));
+    }
     /// Refuse `ui.open_folder` to every script, the app's own too: an app
     /// that must not touch folders, whatever its scripts ask.
     pub fn refuse_folders(self) -> Self {
@@ -2274,11 +2355,65 @@ impl ScriptHost {
         self.0.read_only_shared.borrow_mut().insert(key.clone());
         self.0.exposed_shared.borrow_mut().insert(key, capability);
     }
+    /// Keep names under `prefix` (`"zeron"`: `zeron` and `zeron.…`) for the
+    /// app's own scripts: a plugin may neither offer a `ui.slot` so named nor
+    /// declare a `ui.command` with such an `id`, whatever it is granted. A
+    /// plugin offers only its own names anyway (`<plugin>.…`); this holds
+    /// even for a plugin itself named under the prefix. From the next load.
+    pub fn reserve_prefix(&self, prefix: &str) {
+        rules::start(&self.0).reserve(prefix);
+    }
+    /// Asks `guard` before the app's own scripts reach the host or the
+    /// network: a host action, async action or function (by its name), or a
+    /// `ui.fetch`, remote picture or `ui.socket` (by its URL), each time. An
+    /// `Err` stops it, its text the script's error: what a preview of
+    /// someone's template runs under. A plugin's VM isn't asked: it reaches
+    /// only what its grants say. The last one set applies, at once.
+    pub fn guard(&self, guard: impl Fn(GuardKind, &str) -> Result<(), String> + 'static) {
+        let rules = rules::start(&self.0);
+        rules.set_guard(Rc::new(guard));
+        // The VM already loaded hears it too; a later load's has it from
+        // the start.
+        if let Some(loaded) = &*self.0.current.borrow()
+            && let Some(vm) = loaded._vms.last()
+        {
+            vm.lua.set_app_data(rules::Guarded(rules));
+        }
+    }
+    /// Saves what `ui.persist` keys the guard refused hold
+    /// ([`GuardKind::Persist`]): the person kept what they previewed. How
+    /// many changed what is kept. It saves as any change does, 250 ms after
+    /// (or [`save`](Self::save)); what shows goes on holding its own copy
+    /// until the next load.
+    pub fn keep_held_state(&self) -> usize {
+        let Some(rules) = rules::of(&self.0) else {
+            return 0;
+        };
+        rules
+            .take_held()
+            .into_iter()
+            .filter(|((script, key), held)| {
+                let value = held.value.with_untracked(Clone::clone);
+                // Told where the hold began, as a key with no file starts a
+                // run there: what it became is then a change, and saved.
+                let kept = self.0.persist.state(script, key, held.start.clone());
+                kept.set(value)
+            })
+            .count()
+    }
+    /// Lets go of what `ui.persist` keys the guard refused hold: the person
+    /// reverted. The next load starts from what is saved. Quitting does the
+    /// same: nothing held is ever saved on its own.
+    pub fn drop_held_state(&self) {
+        if let Some(rules) = rules::of(&self.0) {
+            drop(rules.take_held());
+        }
+    }
     /// Ask `capability` of a plugin adding before or after an element by
     /// `target`, written as plugins write it (`"#save"`, `"hook:toolbar.save"`):
     /// every target is open to before and after, as a slot is, unless the
     /// host says so. Replacing an element always takes
-    /// `Capability::Override`.
+    /// `Capability::OverrideElement`.
     pub fn expose_hook(&self, target: impl Into<String>, capability: Option<Capability>) {
         self.0
             .exposed_hooks
@@ -2354,6 +2489,39 @@ impl ScriptHost {
             });
             self.0.window_state.borrow_mut().push(effect);
         }
+    }
+    /// Keep `ui.window.full_screen` as whether the window is in full
+    /// screen (pass its `WindowInfo::fullscreen`), and
+    /// `ui.window.full_screen_transition` as the transition `transition`
+    /// reads while one runs (macOS's animation: going in, `true`, or out,
+    /// and its duration in seconds; `None` otherwise, as it always is on
+    /// Linux and Windows): `{ phase = "entering" | "leaving", duration }`
+    /// or nil. A title bar laid out around the traffic lights moves over
+    /// as they go (`ui.window.controls` is nil in full screen).
+    pub fn window_full_screen(
+        &self,
+        full_screen: Signal<bool>,
+        transition: impl Fn() -> Option<(bool, f64)> + 'static,
+    ) {
+        let full = self.0.shared.state(
+            windows::FULL_SCREEN,
+            Value::Bool(full_screen.with_untracked(|now| *now)),
+        );
+        let moving = self
+            .0
+            .shared
+            .state(windows::FULL_SCREEN_TRANSITION, Value::Nil);
+        let effect = self.0.runtime.effect(move || {
+            let now = Value::Bool(full_screen.get());
+            if full.with_untracked(|was| *was != now) {
+                full.set(now);
+            }
+            let now = windows::full_screen_transition(transition());
+            if moving.with_untracked(|was| *was != now) {
+                moving.set(now);
+            }
+        });
+        *self.0.full_screen.borrow_mut() = Some(effect);
     }
     /// Keep `ui.window.size` as the window's size in points: pass its
     /// `WindowContext::viewport`. For what layout can't say (a sidebar
@@ -2441,6 +2609,17 @@ impl ScriptHost {
     /// terminal (`WindowFactory::set_reserved_shortcuts`).
     pub fn reserved_keys(&self) -> Signal<Vec<String>> {
         self.0.commands.reserved.clone()
+    }
+    /// Whether decision control `key` (`ui.decision`) is on screen: at least
+    /// half of it shows in the window, and no plugin has a window open
+    /// (`Capability::Windows`), which nothing in this window can be above.
+    /// Followed where read reactively. A host holding a pending decision shows
+    /// its own fallback in its top layer (`View::top_layer`) while this is
+    /// false: a plugin replacing what a builder makes (a row, a component)
+    /// takes the control away where no refusal can see it.
+    pub fn decision_shown(&self, key: &str) -> bool {
+        let shown = self.0.decisions.shown(key).get();
+        !self.0.windows.plugin_window_open() && shown
     }
     /// The windows the scripts declare (`ui.window`), as of the last good
     /// load: open each while its `open` state is true, showing
@@ -3260,7 +3439,9 @@ impl ScriptHost {
         let persist = self.0.persist.clone();
         let timers = self.0.timers.clone();
         let host = self.clone();
-        component(move |cx| {
+        // A host with rules is asked of the links in its view.
+        let links = rules::of(&self.0).map(|rules| rules::link_guard(rules, self.0.error.clone()));
+        let view = component(move |cx| {
             // One frame loop ticks every animation; it idles at rest.
             if let Some(frames) = cx.try_service::<zgx::frame::FrameClock>() {
                 cx.tasks().spawn(engine.run((*frames).clone()));
@@ -3347,7 +3528,11 @@ impl ScriptHost {
                     error_layer(banner, cx)
                 },
             )
-        })
+        });
+        match links {
+            Some(links) => zgx::compose::provide(links, view),
+            None => view,
+        }
     }
 
     fn scripts(&self) -> Vec<Script> {
@@ -3440,15 +3625,24 @@ impl ScriptHost {
         let managed = self.0.managed.borrow().clone();
         for script in self.0.plugins.iter().chain(&files).chain(&managed) {
             // A plugin that fails is left out, not the app: the error is
-            // reported, and the app and the other plugins load.
+            // reported, and the app and the other plugins load. What it
+            // declared before it failed goes with it: no command of its
+            // stays in the menu bar unable to run, no window of its opens.
+            let declared = (self.0.commands.mark(), self.0.windows.mark());
+            let discard = || {
+                self.0.commands.discard_since(declared.0);
+                self.0.windows.discard_since(declared.1);
+            };
             let (vm, root, contributions, added) = match self.run(script, true) {
                 Ok(ran) => ran,
                 Err(error) => {
+                    discard();
                     broken.push(error);
                     continue;
                 }
             };
             if root.is_some() {
+                discard();
                 broken.push(format!(
                     "{}: a plugin contributes with ui.contribute; it returns nothing",
                     script.name()
@@ -3456,7 +3650,10 @@ impl ScriptHost {
                 continue;
             }
             for (slot, owner, node) in contributions {
-                slots.entry(slot).or_default().push((owner, node));
+                slots
+                    .entry(slot)
+                    .or_default()
+                    .push((owner, node, Rc::default()));
             }
             hooks.extend(added);
             vms.push(vm);
@@ -3494,7 +3691,10 @@ impl ScriptHost {
             hooks.set_app(vm);
         }
         for (slot, owner, node) in contributions {
-            slots.entry(slot).or_default().push((owner, node));
+            slots
+                .entry(slot)
+                .or_default()
+                .push((owner, node, Rc::default()));
         }
         hooks.extend(added);
         let root = root.ok_or_else(|| {
@@ -3519,6 +3719,7 @@ impl ScriptHost {
             // Boxed, and none without plugins adding at the app's elements.
             hooks: (!hooks.is_empty()).then(|| Box::new(hooks)),
             sealed: Default::default(),
+            decisions: self.0.decisions.clone(),
             actions: self.0.actions.clone(),
             elements: self.0.elements.clone(),
             runtime: self.0.runtime.clone(),
@@ -3847,6 +4048,14 @@ impl ScriptHost {
             meter: plugin.then(|| meter::Meter::new(&lua, memory, watch)),
             assets: self.0.assets.clone(),
         });
+        // What the host asked of this VM, if anything.
+        if let Some(rules) = rules::of(&self.0) {
+            if plugin {
+                lua.set_app_data(rules::Reserving(rules));
+            } else {
+                lua.set_app_data(rules::Guarded(rules));
+            }
+        }
         // A plugin always loads again in full: nothing of it recorded.
         if !plugin && let Some(tracker) = tracking(&self.0) {
             lua.set_app_data(reloads::Tracked::new(tracker));
@@ -3881,16 +4090,18 @@ impl ScriptHost {
         });
         let may = |capability: Capability| grants.allows(&capability);
         let fetch = may(Capability::Fetch).then(|| self.0.fetcher.clone());
+        let policy = self.0.fetch_policy.clone();
         let actions = self.0.async_actions.clone();
         let upload_files = may(Capability::Files);
         lazy.ui(
             &["call", "fetch", "resource", "task", "try"],
-            move |lua, ui| calls::install(lua, ui, actions, fetch, upload_files),
+            move |lua, ui| calls::install(lua, ui, actions, fetch, policy, upload_files),
         );
         lazy.ui(&["paged", "debounced"], paged::install);
         let connector = may(Capability::Fetch).then(|| self.0.connector.clone());
+        let policy = self.0.fetch_policy.clone();
         lazy.ui(&["socket", "sleep"], move |lua, ui| {
-            socket::install(lua, ui, connector)
+            socket::install(lua, ui, connector, policy)
         });
         let (platform, picked) = (self.0.platform.clone(), self.0.picked.clone());
         let (clipboard, files_allowed) = (may(Capability::Clipboard), may(Capability::Files));
@@ -3918,6 +4129,10 @@ impl ScriptHost {
             theme::install(lua, ui, dir, packages)
         });
         lazy.ui(&["form"], form::install);
+        lazy.ui(
+            &["decision", "sealed", "plugin_page"],
+            node::install_decisions,
+        );
         lazy.ui(&["modifiers"], modifiers::install);
         lazy.ui(&["editor"], element::install_editor);
         lazy.ui(&["router"], router::install);

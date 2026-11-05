@@ -301,7 +301,7 @@ return ui.column {
 
 `ui.socket(url, opts)` keeps a connection open (a WebSocket: a chat's, a feed's) through the host's connector, as React's `useWebSocket`. Its `status` is a state, `"connecting"`, `"open"`, `"reconnecting"` or `"closed"`, for a banner; each message goes to `on_message(message, binary)`, text as a string (decoded first with `json = true`) or a binary message's bytes as a string. A decoded message is the script's own: a plain table, made for it alone, that it may change and keep (add a field, put it in state), where tables read from state are read-only. `send(v)` sends a string as text and any other value as JSON, and `send_bytes(s)` a binary message; sent while the connection is not open, they wait and go in order once it is. `buffered` is a state of the bytes sent and not yet taken by the connection, and past `max_buffered` (16 MB) `send` refuses, returning false, as it does once the socket is closed for good. A connection that ends or fails opens again after a wait: `reconnect = { min = 500, max = 30000, factor = 2, jitter = 0.2, attempts = math.huge }` is the default (true), `false` none. Meanwhile `attempt` counts and `retry_in` is the wait in ms; out of attempts it is `"closed"`, and `error` (a `UiError`, tracked) says why it last ended. `on_open` and `on_close(err)` hear each connection begin and end. `close()` closes it until `reconnect()`, which also cuts a wait short. `url` may be a function: a state it reads changing (a room, a token) opens it again at once. It closes with its owner (a component, or the script on reload).
 
-The host connects with `ScriptHost::socket_connector(|request, socket| async { … })`: it opens `request.url`, calls `socket.opened()`, hands each message that arrives to `socket.receive`, and sends what `socket.next().await` gives, as fast as the connection takes it, until that answers `None` (the script closed it); its future answers `Ok(())` when the connection ends and `Err(message)` when it fails. A plugin needs the host's `Capability::Fetch`. `ui.sleep(ms)` is a promise settled after `ms`, to await in a task.
+The host connects with `ScriptHost::socket_connector(|request, socket| async { … })`: it opens `request.url`, calls `socket.opened()`, hands each message that arrives to `socket.receive`, and sends what `socket.next().await` gives, as fast as the connection takes it, until that answers `None` (the script closed it); its future answers `Ok(())` when the connection ends and `Err(message)` when it fails. A plugin needs the host's `Capability::Fetch`, and the app's `fetch_policy` is asked of its URL and addresses (see Plugins in `docs/scripting.md`). `ui.sleep(ms)` is a promise settled after `ms`, to await in a task.
 
 ```lua
 type Message = { from: string, text: string }
@@ -426,7 +426,7 @@ return ui.column {
 
 `ui.args` is what the app was launched with after its script (`zgx-run app/ notes.txt` gives `{ "notes.txt" }`), and `ui.on_open(handler)` is handed the files and URLs the system asks it to open: those among its launch's arguments, and with an `application_id` (reverse-DNS, in `zgx.json` or `Application::application_id`) a file opened with the app, a link to it, or a second launch's on Windows. Its files are the user's choice, as a dialog's are, so `ui.read_file` takes them; what arrives before the script registers its handler waits for it. It is the app's: a plugin's `ui.on_open` is an error.
 
-Plugins reach the network, the clipboard and files only if the host grants each: `ScriptHost::grant("plugin.luau", Capability::Fetch)` (or `Clipboard`, `Files`; `Plugin::grants` for the plugins an app sets), and the app's actions and shared state only where it exposes them (see Plugins in `docs/scripting.md`). A plugin that fails to load is left out and its error reported; the app and the other plugins load.
+Plugins reach the network, the clipboard and files only if the host grants each: `ScriptHost::grant("plugin.luau", Capability::Fetch)` (or `Clipboard`, `Files`; `Plugin::grants` for the plugins an app sets), where it may reach is the app's `ScriptHost::fetch_policy(impl FetchPolicy)`, and the app's actions and shared state only where it exposes them (see Plugins in `docs/scripting.md`). A plugin that fails to load is left out and its error reported; the app and the other plugins load.
 
 ## Computeds, effects, batches
 
@@ -708,7 +708,7 @@ ui.contribute { target = "#save", before = ui.button { label = "Preview" } }
 - Nothing else is filtered: its handlers, styles and state stay the app's. A filter that fails is reported as the plugin's error, and the value shows as it was.
 
 ```luau
--- file: plugins/shout.luau (granted Capability::Override("#title"))
+-- file: plugins/shout.luau (granted Capability::OverrideElement("#title"))
 ui.filter { target = "#title", text = function(text) return string.upper(text) end }
 ui.filter {
 	target = "#tasks",
@@ -730,12 +730,12 @@ A plugin targeting an `id` that is not a declared `hook` reaches the app's inter
 `ui.override { module = "@app/<path>", with = "<plugin path>" }`, from a plugin, replaces one of the app's modules: wherever the app requires `@app/<path>`, it gets the plugin's module instead.
 
 - `module` is one of the app's `@app/…` modules (`@app` is the app's directory; a relative require is never replaced). `with` is one of the plugin's own files, a directory as its `init.luau`.
-- It needs `Capability::Override(module)` or `Capability::Override("*")`, **a trust grant**: the replacement runs in the app's VM as the app's own code, with all its access. Of several plugins, the last one's wins.
+- It needs `Capability::OverrideModule(module)` or `Capability::OverrideModule("*")`, **a trust grant**: the replacement runs in the app's VM as the app's own code, with all its access. Of several plugins, the last one's wins.
 - The replacement may `require("@app-original/<path>")` for the module it replaces (to wrap it); nothing else may. Its own relative requires reach its plugin's directory.
 - A plugin requires none of the app's modules; a `.luaurc` defining an `app` or `app-original` alias is an error.
 
 ```lua
--- file: plugins/badges/init.luau (granted Capability::Override("@app/components/card"))
+-- file: plugins/badges/init.luau (granted Capability::OverrideModule("@app/components/card"))
 ui.override { module = "@app/components/card", with = "./card" }
 
 -- file: plugins/badges/card.luau

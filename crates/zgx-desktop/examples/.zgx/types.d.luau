@@ -198,6 +198,28 @@ export type ColorToken =
 	| "$selection.text.inactive"
 	| "$find.match"
 	| "$find.current"
+	| "$terminal.foreground"
+	| "$terminal.background"
+	| "$terminal.cursor"
+	| "$terminal.cursor_text"
+	| "$terminal.selection_background"
+	| "$terminal.selection_foreground"
+	| "$terminal.ansi.0"
+	| "$terminal.ansi.1"
+	| "$terminal.ansi.2"
+	| "$terminal.ansi.3"
+	| "$terminal.ansi.4"
+	| "$terminal.ansi.5"
+	| "$terminal.ansi.6"
+	| "$terminal.ansi.7"
+	| "$terminal.ansi.8"
+	| "$terminal.ansi.9"
+	| "$terminal.ansi.10"
+	| "$terminal.ansi.11"
+	| "$terminal.ansi.12"
+	| "$terminal.ansi.13"
+	| "$terminal.ansi.14"
+	| "$terminal.ansi.15"
 export type NumberToken =
 	"$glass.blur"
 	| "$font.size.xs"
@@ -330,6 +352,28 @@ export type TokenName =
 	| "find.match"
 	| "find.current"
 	| "mark.radius"
+	| "terminal.foreground"
+	| "terminal.background"
+	| "terminal.cursor"
+	| "terminal.cursor_text"
+	| "terminal.selection_background"
+	| "terminal.selection_foreground"
+	| "terminal.ansi.0"
+	| "terminal.ansi.1"
+	| "terminal.ansi.2"
+	| "terminal.ansi.3"
+	| "terminal.ansi.4"
+	| "terminal.ansi.5"
+	| "terminal.ansi.6"
+	| "terminal.ansi.7"
+	| "terminal.ansi.8"
+	| "terminal.ansi.9"
+	| "terminal.ansi.10"
+	| "terminal.ansi.11"
+	| "terminal.ansi.12"
+	| "terminal.ansi.13"
+	| "terminal.ansi.14"
+	| "terminal.ansi.15"
 
 -- "#rgb", "#rrggbb", "#rrggbbaa", "rgb(…)", "rgba(…)", "hsl(…)", a few
 -- names, 0xrrggbb, or a colour token ("$text.secondary"; `ColorToken`
@@ -474,6 +518,8 @@ export type Tokens = {
 		sunken: string,
 	},
 	terminal: {
+		ansi: { string },
+		background: string,
 		badge: {
 			pad: string,
 			radius: string,
@@ -502,6 +548,8 @@ export type Tokens = {
 		},
 		claude: string,
 		control_hover: string,
+		cursor: string,
+		cursor_text: string,
 		danger: {
 			bg: string,
 			hover: string,
@@ -515,6 +563,7 @@ export type Tokens = {
 			ring: string,
 		},
 		footer: string,
+		foreground: string,
 		glass: string,
 		glass_hover: string,
 		grip: {
@@ -574,6 +623,8 @@ export type Tokens = {
 		},
 		scrim: string,
 		scrim_light: string,
+		selection_background: string,
+		selection_foreground: string,
 		sheet: {
 			bg: string,
 			gap: string,
@@ -1626,6 +1677,10 @@ export type ItemWindow = {
 -- A rect in points, from the window's top left.
 export type WindowRect = { x: number, y: number, width: number, height: number }
 
+-- A window going into full screen or out (macOS's animation): which way,
+-- and about how many seconds it takes (as long as the last one that way).
+export type FullScreenTransition = { phase: "entering" | "leaving", duration: number }
+
 -- `ui.window`: called, it declares a window (`WindowOptions`). Its fields
 -- are the app's own window's title bar, as the web's Window Controls
 -- Overlay gives it: `titlebar_area`, where the app may draw in the strip an
@@ -1652,6 +1707,15 @@ declare extern type WindowApi with
 	-- is false is worth a notification or a badge.
 	active: State<boolean>
 	shown: State<boolean>
+	-- Whether the window is in full screen, read-only and followed, however
+	-- it went in or out (the green button, Ctrl+Cmd+F, the menu, Mission
+	-- Control, a script), turning as it begins to go; and while it goes
+	-- (macOS animates it), which way and for how long, nil once it is there
+	-- (and always on Linux and Windows). In full
+	-- screen `controls` is nil: a title bar laid out around the traffic
+	-- lights moves over as they go.
+	full_screen: State<boolean>
+	full_screen_transition: State<FullScreenTransition?>
 	-- The window's size in points, read-only and followed: for decisions
 	-- layout can't make (a sidebar collapsing to icons below a width).
 	-- Sizes themselves are layout's: percentages, `grow`, `max_w`.
@@ -15490,6 +15554,11 @@ export type ListProps = {
 	-- Its rows are one Tab stop, and the arrows, Page Up and Down, Home and
 	-- End move focus through every row (mounting it), as a list box's do.
 	keyboard: boolean?,
+	-- "ancestor": it doesn't scroll itself but with the scroll view around
+	-- it (a panel scrolling as a whole, its sections lists), as tall as its
+	-- rows, building only those that view shows. With `height` or
+	-- `heights`, not `measured`.
+	virtualize: "ancestor"?,
 	-- The list its rows show, as `ui.each`'s (not with `count` or
 	-- `heights`): `key` is given an item, and `row` an item and its index
 	-- as a state; built again when the item changes, or, taking a third
@@ -19889,6 +19958,16 @@ declare ui: {
 	-- What `build` makes of the value, entering and exiting as it changes;
 	-- nil shows nothing. The value is `any`, as `each`'s item is.
 	presence: (value: string | Readable<unknown> | (() -> unknown), build: (value: any) -> Node, opts: PresenceOptions?) -> Node,
+	-- Controls no plugin reaches or covers (tool approval, sign-in): drawn and
+	-- hit over all a plugin opens, in the room this holds in flow. The app's
+	-- own script alone makes one.
+	decision: (props: Merge<ContainerProps, { key: string, label: string? }>) -> Node,
+	-- A region no plugin reaches, filters or draws over (a Settings page), but
+	-- for its `plugin_page`s. The app's own script alone makes one.
+	sealed: (props: Merge<ContainerProps, { key: string?, label: string? }>) -> Node,
+	-- In a `sealed` region: that plugin's own page, what it gives
+	-- `ui.contribute("plugin_page", …)`, kept to this box.
+	plugin_page: (props: Merge<Props, { plugin: string }>) -> Node,
 	-- Where plugins' contributions to `name` go.
 	-- A plugin extension point. `context` reaches what is contributed to
 	-- it: a contributed component gets it as `props.slot` (one component,

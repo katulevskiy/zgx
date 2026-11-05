@@ -68,6 +68,8 @@ A `Web` controller's `url`, `title`, `loading`, `progress`, `can_go_back`, `can_
 
 A `Term`'s `id`, `title`, `pwd`, `process`, `pid`, `focused`, `bell` (it rang since it last had focus), `progress` (OSC 9;4: 0 to 1, negative while indeterminate, nil when none), `exited` (the exit code, once it ended), `columns`, `rows` and `pointer` are tracked like state. Its methods: `focus()`, `blur()`, `input(text)` (as typed: `"ls\r"` runs ls), `paste(text)`, `binding(action)` (a Ghostty binding action: `"copy_to_clipboard"`, `"clear_screen"`, `"increase_font_size:1"`), `needs_confirm()` (whether closing would end something other than an idle shell), `snapshot(max_width?)` (a picture of what it shows now, at most `max_width` pixels wide, 480 if not given: the `src` of a `ui.image` showing it, as `"host:…"`, replaced by each call and forgotten as it closes; nil before it shows or where the platform takes none, macOS taking it from Ghostty's last frame) and `close()`.
 
+A terminal's colours come from the theme where it shows, through the tokens `$terminal.foreground`, `$terminal.background`, `$terminal.cursor`, `$terminal.cursor_text` (text under a block cursor), `$terminal.selection_background`, `$terminal.selection_foreground` and `$terminal.ansi.0` to `$terminal.ansi.15` (the ANSI colours by number; 8 to 15 are the bright ones). No built-in theme sets them, and an unset one keeps the terminal's own colour. Under Ghostty that is the user's Ghostty configuration (`foreground`, `background`, `cursor-color`, `cursor-text`, `selection-background`, `selection-foreground`, `palette`), which the tokens set go over. In the engine-drawn terminal it is its built-in palette. A theme switch, a followed system appearance or a `theme` over the node recolours what the terminal shows live, scrollback included, without restarting the program: `ui.terminal { term = term, theme = { ["terminal.foreground"] = "#202124", ["terminal.ansi.1"] = "#b00020" } }`. Ghostty's colours are opaque, so a token's alpha is dropped there. A VS Code theme sets these tokens from its `terminal.*` colours.
+
 ## Command options
 
 | Option | Type | Default | |
@@ -187,6 +189,35 @@ return ui.row {
 	ui.text { "Title" },
 }
 ```
+
+### Full screen
+
+```luau
+ui.window.full_screen: State<boolean>
+ui.window.full_screen_transition: State<{ phase: "entering" | "leaving", duration: number }?>
+```
+
+`ui.window.full_screen` is whether the window is in full screen, however it went in or out: the green button, Ctrl+Cmd+F, the View menu, Mission Control, or a script. On macOS it turns as the window begins going in or out. `ui.window.full_screen_transition` is the transition while one runs (macOS animates it, `set_fullscreen`'s too): `phase` is `"entering"` or `"leaving"`, and `duration` is about how many seconds it takes (AppKit doesn't say: as long as the last one that way took, about 0.55 at first). It begins just before `full_screen` turns, and is nil once the window is there. It is nil always on Linux and Windows, where `full_screen` changes at once. Both are read-only.
+
+In full screen macOS hides the traffic lights, and `ui.window.controls` is nil. Through a transition `controls` and `titlebar_area` already say where they end up: nil from the moment the window begins going in, and their place out of full screen from the moment it begins coming out. A title bar laid out around them can slide over as they go:
+
+```lua
+return ui.row {
+	h = 44,
+	window_drag = true,
+	items = "center",
+	-- Clear of the traffic lights, flush once full screen hides them,
+	-- eased about as long as AppKit's animation.
+	pl = ui.tween(ui.window.full_screen, { duration = 500, from = 84, to = 12 }),
+	ui.text { "Title" },
+}
+```
+
+Something timed by hand (an `anime` animation) can read the transition's own `duration` as it begins.
+
+AppKit animates a snapshot of the window through the transition, and shows the window itself again as it ends. What is drawn meanwhile keeps the content current, but is not on the screen: a tween runs behind the snapshot, and the window shows it finished. `ui.window.shown` stays true through the transition; a window still covered once it is over counts as covered then.
+
+`zgx run` keeps both; a Rust host passes its window's with `ScriptHost::window_full_screen` (`WindowInfo::fullscreen` and `WindowContext::full_screen_transition`).
 
 ### Zoom
 

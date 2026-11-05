@@ -161,6 +161,9 @@ pub(crate) struct Windows {
     /// The published windows' content, by id.
     pub content: RefCell<HashMap<String, Content>>,
     pub list: Signal<Vec<Window>>,
+    /// What says a plugin's windows are open: each window's `open`, each
+    /// group's list. The load's.
+    plugin_opens: RefCell<Vec<Signal<Value>>>,
     /// Each window's own state (`win`), by id: the same across loads, as
     /// the host bound it when the window opened.
     states: RefCell<HashMap<String, WindowState>>,
@@ -175,6 +178,7 @@ impl Windows {
             first_errors: RefCell::default(),
             content: RefCell::default(),
             list: runtime.signal(Vec::new()),
+            plugin_opens: RefCell::default(),
             states: RefCell::default(),
         }
     }
@@ -192,10 +196,32 @@ impl Windows {
             .borrow_mut()
             .retain(|id, _| list.iter().any(|w| &w.id == id));
     }
+    /// Whether a plugin has a window open, followed where read reactively.
+    pub fn plugin_window_open(&self) -> bool {
+        self.plugin_opens.borrow().iter().any(|open| {
+            open.with(|value| match value {
+                Value::List(items) => !items.is_empty(),
+                other => other.truthy(),
+            })
+        })
+    }
     /// A load begins: what it declares replaces what is published.
     pub fn begin(&self) {
+        self.plugin_opens.borrow_mut().clear();
         self.pending.borrow_mut().clear();
         self.pending_groups.borrow_mut().clear();
+    }
+    /// Where the load's declarations are, before a script runs.
+    pub fn mark(&self) -> (usize, usize) {
+        (
+            self.pending.borrow().len(),
+            self.pending_groups.borrow().len(),
+        )
+    }
+    /// A script failed as it loaded: what it declared since `mark` goes.
+    pub fn discard_since(&self, (windows, groups): (usize, usize)) {
+        self.pending.borrow_mut().truncate(windows);
+        self.pending_groups.borrow_mut().truncate(groups);
     }
     /// The load succeeded: publish what it declared. What failed to build
     /// as it did (an item's window), for the load's error.
@@ -510,6 +536,27 @@ pub(crate) const ZOOMABLE: &str = "zgx.window.zoomable";
 /// `ui.window.shown`, which a script reads.
 pub(crate) const ACTIVE: &str = "zgx.window.active";
 pub(crate) const SHOWN: &str = "zgx.window.shown";
+/// The shared keys holding whether the app's window is in full screen
+/// and the transition going on, if one is (`ScriptHost::window_full_screen`):
+/// `ui.window.full_screen` and `ui.window.full_screen_transition`, which a
+/// script reads.
+pub(crate) const FULL_SCREEN: &str = "zgx.window.full_screen";
+pub(crate) const FULL_SCREEN_TRANSITION: &str = "zgx.window.full_screen_transition";
+
+/// A full-screen transition as `ui.window.full_screen_transition` holds it:
+/// going in (`true`) or out, over `duration` seconds; nil for none.
+pub(crate) fn full_screen_transition(transition: Option<(bool, f64)>) -> Value {
+    transition.map_or(Value::Nil, |(entering, duration)| {
+        Value::Map(Rc::from([
+            (Rc::from("duration"), Value::Num(duration)),
+            (
+                Rc::from("phase"),
+                Value::from(if entering { "entering" } else { "leaving" }),
+            ),
+        ]))
+    })
+}
+
 /// The shared key holding the app's window's size in points
 /// (`ScriptHost::window_size`): `ui.window.size`, `{ width, height }`,
 /// which a script reads.
@@ -585,7 +632,7 @@ pub(crate) fn install(
                 Some("zoom") => Some(shared.state(ZOOM, Value::Num(1.))),
                 Some("zoomable") => Some(shared.state(ZOOMABLE, Value::Bool(true))),
                 Some("visible") => Some(shared.state(VISIBLE, Value::Bool(true))),
-                Some("active" | "shown") => None,
+                Some("active" | "shown" | "full_screen" | "full_screen_transition") => None,
                 _ => return Ok(mlua::Value::Nil),
             };
             if let Some(state) = state {
@@ -597,6 +644,8 @@ pub(crate) fn install(
             let state = State::new(match read {
                 "active" => shared.state(ACTIVE, Value::Bool(true)),
                 "shown" => shared.state(SHOWN, Value::Bool(true)),
+                "full_screen" => shared.state(FULL_SCREEN, Value::Bool(false)),
+                "full_screen_transition" => shared.state(FULL_SCREEN_TRANSITION, Value::Nil),
                 _ => shared.state(SIZE, size(0., 0.)),
             });
             window.raw_set(key.clone(), ReadState(state, read.into()))?;
@@ -611,9 +660,13 @@ pub(crate) fn install(
             let id: String = table
                 .get::<Option<String>>("id")?
                 .ok_or_else(|| mlua::Error::runtime("ui.window needs an `id`"))?;
+            crate::rules::guard(lua, crate::GuardKind::Window, &id)?;
             let what = |field: &str| format!("ui.window `{id}`'s `{field}`");
             let open = expect_state(&table.get::<mlua::Value>("open")?, &what("open"))?;
             let runtime = crate::node::env(lua)?.runtime.clone();
+            if matches!(&*crate::node::env(lua)?.grants, crate::Grants::Only(_)) {
+                windows.plugin_opens.borrow_mut().push(open.clone());
+            }
             let (window, node) =
                 window_of(&table, id, open, true, Some((lua, &windows)), &runtime)?;
             let mut pending = windows.pending.borrow_mut();
@@ -644,6 +697,9 @@ pub(crate) fn install(
                     Some(options) => (options.get("key")?, options.get("on_close")?),
                     None => (None, None),
                 };
+                if matches!(&*env.grants, crate::Grants::Only(_)) {
+                    groups.plugin_opens.borrow_mut().push(list.clone());
+                }
                 groups.pending_groups.borrow_mut().push(Group {
                     list,
                     build,
