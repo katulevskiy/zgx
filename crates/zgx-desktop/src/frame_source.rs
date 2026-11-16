@@ -133,6 +133,10 @@ impl FrameTimer {
         let next = (current / every + 1) * every;
         self.epoch + interval.mul_f64(next.saturating_sub(self.first) as f64)
     }
+    /// When refresh `index` (as `frame` numbers them) starts.
+    pub(crate) fn start_of(&self, index: u64, interval: Duration) -> Instant {
+        self.epoch + interval.mul_f64(index.saturating_sub(self.first) as f64)
+    }
     /// The frame for the boundary at or before `now`. It is expected on screen
     /// one refresh later, once rendered.
     pub(crate) fn frame(&self, now: Instant, interval: Duration) -> Frame {
@@ -1175,11 +1179,71 @@ mod compositor_clock {
     }
 }
 
+/// Wayland: when to ask for the next frame after one the compositor granted
+/// presented nothing (a rate-limited animation's skipped refresh, or a step
+/// that damaged nothing). Such a frame asks for no frame callback, so a
+/// redraw asked for at once is granted at once: the event loop would turn
+/// tens of thousands of times a second until the animation's next step. It
+/// waits instead for the start of the refresh some waiting request takes
+/// (`FrameClock::next_due`), or with none waiting (frames wanted for other
+/// work), the next refresh: never at once.
+pub(crate) fn unpresented_frame_retry(
+    clock: &zgx::frame::FrameClock,
+    timer: &FrameTimer,
+    now: Instant,
+    interval: Duration,
+) -> Instant {
+    let index = timer.frame(now, interval).index;
+    let refresh = 1. / interval.as_secs_f64().max(1e-6);
+    // Just past the refresh's start, so the frame then made (`frame`) is
+    // that refresh's whatever the rounding, and never at once.
+    const PAST: Duration = Duration::from_micros(100);
+    let due = clock
+        .next_due(index, refresh)
+        .unwrap_or(index.saturating_add(1));
+    (timer.start_of(due, interval) + PAST).max(now + PAST)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const REFRESH: Duration = Duration::from_nanos(16_666_667);
+
+    /// A Wayland window idle but for a 30 fps spinner whose steps present
+    /// nothing (scrolled out of view): each granted frame that presents
+    /// nothing waits for the spinner's next step, so a second takes about
+    /// as many loop turns as the spinner has steps, not one per turn of a
+    /// busy loop.
+    #[test]
+    fn an_idle_rate_limited_animation_waits_for_its_next_step() {
+        use std::{future::Future, task::Context, task::Waker};
+        for interval in [REFRESH, Duration::from_nanos(6_944_444)] {
+            let clock = zgx::frame::FrameClock::new();
+            let epoch = Instant::now();
+            let timer = FrameTimer::new(epoch);
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut step = Box::pin(clock.next().max_rate(30.));
+            assert!(step.as_mut().poll(&mut cx).is_pending());
+            let (mut now, mut turns, mut steps) = (epoch, 0, 0);
+            while now < epoch + Duration::from_secs(1) {
+                turns += 1;
+                assert!(turns < 1000, "the loop spins at {interval:?}");
+                // The compositor grants the frame asked for at once.
+                clock.deliver(timer.frame(now, interval));
+                if let std::task::Poll::Ready(_) = step.as_mut().poll(&mut cx) {
+                    steps += 1;
+                    step = Box::pin(clock.next().max_rate(30.));
+                    assert!(step.as_mut().poll(&mut cx).is_pending());
+                }
+                let retry = unpresented_frame_retry(&clock, &timer, now, interval);
+                assert!(retry > now, "a retry at once is the busy loop");
+                now = retry;
+            }
+            assert!((29..=31).contains(&steps), "{steps} steps at {interval:?}");
+            assert!(turns <= steps + 2, "{turns} turns for {steps} steps");
+        }
+    }
     fn ms(ms: f64) -> Duration {
         Duration::from_secs_f64(ms / 1000.)
     }
